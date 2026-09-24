@@ -1,2 +1,5 @@
 node_modules/
 dist/
+
+# local progress notes (kept locally, not committed)
+fleet-progress-*.md

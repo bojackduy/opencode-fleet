@@ -1,13 +1,51 @@
 {
-  "name": "opencode-fleet-v1",
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "@bojackduy/opencode-fleet-v1",
   "version": "0.1.0",
-  "private": true,
+  "description": "Lightweight orchestrator → workers for OpenCode v1 (file spool + prompt_async, takeover-friendly).",
   "type": "module",
   "main": "dist/index.js",
-  "description": "Lightweight orchestrator → workers for OpenCode v1 (file spool + prompt_async, takeover-friendly).",
+  "license": "AGPL-3.0-or-later",
+  "private": false,
+  "author": "bojackduy",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bojackduy/opencode-fleet-v1.git"
+  },
+  "homepage": "https://github.com/bojackduy/opencode-fleet-v1#readme",
+  "bugs": {
+    "url": "https://github.com/bojackduy/opencode-fleet-v1/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "orchestrator",
+    "fleet",
+    "multi-session",
+    "prompt-async",
+    "takeover"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepack": "npm run typecheck && npm run build",
+    "test": "echo \"no tests\" && exit 0",
+    "release:patch": "npm run typecheck && npm run build && npm version patch -m \"chore: release %s\" && git push && git push origin $(git describe --tags --abbrev=0)",
+    "release:minor": "npm run typecheck && npm run build && npm version minor -m \"chore: release %s\" && git push && git push origin $(git describe --tags --abbrev=0)",
+    "release:major": "npm run typecheck && npm run build && npm version major -m \"chore: release %s\" && git push && git push origin $(git describe --tags --abbrev=0)"
   },
   "dependencies": {
     "@opencode-ai/plugin": "1.18.32"
@@ -15,8 +53,5 @@
   "devDependencies": {
     "typescript": "^5.6.3",
     "@types/node": "^22.7.4"
-  },
-  "engines": {
-    "node": ">=20"
   }
 }
