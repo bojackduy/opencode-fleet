@@ -15,7 +15,7 @@
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join } from "node:path";
-import { INBOX_POLL_MS, messagesDir, readReq, writeRes } from "./fileTransport.js";
+import { INBOX_POLL_MS, hopOf, isHopExceeded, loopGuardText, messagesDir, readReq, writeRes } from "./fileTransport.js";
 import type { FleetEnvelope, FleetModel } from "./fileTransport.js";
 import { writeNotify } from "./notify.js";
 import { readRegistry, registerSelf, removeSession } from "./registry.js";
@@ -63,11 +63,14 @@ export function claimedPath(reqId: string): string {
 
 /**
  * Build the user-bubble text for an injected delegation. The header keeps
- * manual takeover readable; the DONE footer is always appended so the
- * commander can poll reliably even when the original message omits it.
+ * manual takeover readable (and carries the hop count); the body is passed
+ * through untouched so any `Re: <reqId>` chain refs survive; the DONE
+ * footer is always appended so the commander can poll reliably even when
+ * the original message omits it.
  */
 export function buildInjectText(envelope: FleetEnvelope): string {
-  const header = `[from fleet-v1 ${envelope.reqId} | commander:${envelope.fromCommander}]`;
+  const hop = hopOf(envelope);
+  const header = `[from fleet-v1 ${envelope.reqId} | commander:${envelope.fromCommander} | hop:${hop}]`;
   const body = (envelope.message ?? "").trim();
   if (/DONE:/.test(body)) return `${header}\n${body}\n${DONE_FOOTER}`;
   return `${header}\n${body}\n${DONE_FOOTER}`;
@@ -242,6 +245,17 @@ export function startInboxWatcher(opts: StartInboxWatcherOpts): InboxWatcherHand
 
   async function handleOne(reqId: string, envelope: FleetEnvelope): Promise<void> {
     try {
+      // P5 loop guard: refuse to forward envelopes past MAX_HOPS.
+      if (isHopExceeded(envelope)) {
+        const text = loopGuardText(reqId, hopOf(envelope));
+        try {
+          await writeRes(reqId, { ok: false, error: text });
+        } catch {
+          // writeRes failing must not crash the watcher.
+        }
+        log(`fleet-v1 req ${reqId}: ${text}`);
+        return;
+      }
       await writeFile(claimedPath(reqId), daemonId, { mode: 0o600 }).catch(() => undefined);
       const injectText = buildInjectText(envelope);
       const parsedModel = parseFleetModel(envelope.model);
@@ -360,6 +374,16 @@ export async function handleSessionEvent(event: any, selfSessionId: string): Pro
           directory: self.directory,
           ...(self.title !== undefined ? { title: self.title } : {}),
           ...(self.summary !== undefined ? { summary: self.summary } : {}),
+          ...(self.agent !== undefined ? { agent: self.agent } : {}),
+          ...(self.model !== undefined ? { model: self.model } : {}),
+          ...(self.status !== undefined ? { status: self.status } : {}),
+          ...(self.lastDone !== undefined ? { lastDone: self.lastDone } : {}),
+          ...((self as { role?: unknown }).role !== undefined
+            ? { role: (self as { role?: "commander" | "worker" | "peer" }).role }
+            : {}),
+          ...((self as { parentID?: unknown }).parentID !== undefined
+            ? { parentID: (self as { parentID?: string }).parentID }
+            : {}),
           updatedAt: Date.now(),
         });
       } catch {

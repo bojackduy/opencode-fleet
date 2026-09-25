@@ -19,7 +19,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tool } from "@opencode-ai/plugin";
 import { buildInjectText, DONE_FOOTER } from "../inbox.js";
-import { messagesDir, readReq, writeReq } from "../fileTransport.js";
+import { chainRefsOf, hopOf, isHopExceeded, loopGuardText, messagesDir, readReq, writeReq } from "../fileTransport.js";
 import type { FleetEnvelope } from "../fileTransport.js";
 import { listRegistry } from "../registry.js";
 import { readNotify } from "../notify.js";
@@ -143,6 +143,14 @@ export async function fleetHandoffBackHandler(
       // registry is best-effort; spool still works without targetDaemonId.
     }
 
+    // P5 loop guard: the reverse handoff extends the chain by one hop.
+    // NOTE: handoff_back intentionally bypasses the commander role check
+    // (worker->commander reverse is always allowed) but stays loop-guarded.
+    const hop = hopOf(inbound) + 1;
+    if (isHopExceeded({ hop })) {
+      return `fleet_handoff_back ${loopGuardText(`handoff-after-${inbound.reqId}`, hop)}`;
+    }
+
     const reqId = `handoff-${Date.now()}-${randomSuffix()}`;
     const raw =
       `${message.trim()}\nRe: ${inbound.reqId}` +
@@ -154,6 +162,7 @@ export async function fleetHandoffBackHandler(
       ...(targetDaemonId ? { targetDaemonId } : {}),
       message: raw,
       createdAt: Date.now(),
+      hop,
       ...(typeof args?.agent === "string" && args.agent !== "" ? { agent: args.agent } : {}),
       ...(args?.model !== undefined && args.model !== null && args.model !== ""
         ? { model: args.model as FleetEnvelope["model"] }
@@ -253,7 +262,7 @@ export async function fleetThreadHandler(
         ? `no thread entries for reqId ${filter}`
         : "no thread entries";
     }
-    const lines = ["reqId|from->to|done|snippet"];
+    const lines = ["reqId|from->to|hop|chain|done|snippet"];
     for (const env of slice) {
       let done = "-";
       // Prefer the notify sidecar, fall back to the .res.json reply.
@@ -282,7 +291,9 @@ export async function fleetThreadHandler(
       void DONE_FOOTER;
       const from = env.fromCommander ?? "?";
       const to = env.targetSessionId ?? "?";
-      lines.push(`${env.reqId}|${from}->${to}|${done}|${snippetOf(env.message ?? "")}`);
+      const hop = hopOf(env);
+      const chain = chainRefsOf(env.message ?? "");
+      lines.push(`${env.reqId}|${from}->${to}|${hop}|${chain.length > 0 ? chain.join(",") : "-"}|${done}|${snippetOf(env.message ?? "")}`);
     }
     return lines.join("\n");
   } catch (err) {

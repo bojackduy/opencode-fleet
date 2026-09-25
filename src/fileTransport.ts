@@ -38,6 +38,8 @@ export interface FleetEnvelope {
   system?: string;
   /** Epoch millis when the request was written. */
   createdAt: number;
+  /** P5 loop guard: forward hops so far (default 0). Refuse hop > MAX_HOPS. */
+  hop?: number;
 }
 
 export interface FleetResult {
@@ -50,6 +52,63 @@ export interface FleetResult {
 export const RESPONSE_POLL_MS = 500;
 /** Poll cadence for inbox scans (worker InboxWatcher, Phase 2). */
 export const INBOX_POLL_MS = 1000;
+/** P5 loop guard: max forward hops before a delegation is refused. */
+export const MAX_HOPS = 3;
+
+/** Hop count of an envelope; missing/invalid reads as 0. Never throws. */
+export function hopOf(envelope: Pick<FleetEnvelope, "hop"> | null | undefined): number {
+  try {
+    const h = (envelope as { hop?: unknown } | null | undefined)?.hop;
+    if (typeof h === "number" && Number.isFinite(h) && h >= 0) return Math.floor(h);
+    return 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** True when the envelope exceeded MAX_HOPS. Never throws. */
+export function isHopExceeded(envelope: Pick<FleetEnvelope, "hop"> | null | undefined): boolean {
+  try {
+    return hopOf(envelope) > MAX_HOPS;
+  } catch {
+    return false;
+  }
+}
+
+/** Next hop count when forwarding an envelope (hop + 1). Never throws. */
+export function nextHop(envelope: Pick<FleetEnvelope, "hop"> | null | undefined): number {
+  try {
+    return hopOf(envelope) + 1;
+  } catch {
+    return 1;
+  }
+}
+
+/** Readable loop-guard refusal text. Never throws. */
+export function loopGuardText(reqId: string, hop: number): string {
+  try {
+    const id = String(reqId ?? "").trim() || "(unknown req)";
+    return `loop guard: max ${MAX_HOPS} hops (req ${id} hop=${hop})`;
+  } catch {
+    return `loop guard: max ${MAX_HOPS} hops`;
+  }
+}
+
+/** Extract `Re: <reqId>` chain refs from a message body. Never throws. */
+export function chainRefsOf(message: string): string[] {
+  try {
+    const out: string[] = [];
+    const re = /Re:\s*([A-Za-z0-9._-]+)/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(message ?? "")) !== null) {
+      const ref = (m[1] ?? "").trim();
+      if (ref !== "" && !out.includes(ref)) out.push(ref);
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
 
 export function stateDir(): string {
   const xdg = process.env.XDG_STATE_HOME;

@@ -25,6 +25,9 @@ import {
 } from "./inbox.js";
 import {
   INBOX_POLL_MS,
+  hopOf,
+  isHopExceeded,
+  loopGuardText,
   messagesDir,
   readReq,
   writeRes,
@@ -47,6 +50,11 @@ import {
   makeFleetPolicyTool,
   makeFleetSummaryTool,
 } from "./tools/fleetAdmin.js";
+import {
+  makeFleetClaimCommanderTool,
+  makeFleetReleaseCommanderTool,
+  makeFleetTreeTool,
+} from "./tools/fleetRoles.js";
 import { currentVersion, isV1Daemon, isV1Version, V1_BIN, V1_VERSION } from "./v1.js";
 
 const RESPONSE_POLL_MS = 500;
@@ -183,6 +191,17 @@ function startDaemonWatcher(
     envelope: NonNullable<Awaited<ReturnType<typeof readReq>>>,
   ): Promise<void> {
     try {
+      // P5 loop guard: refuse to forward envelopes past MAX_HOPS.
+      if (isHopExceeded(envelope)) {
+        const text = loopGuardText(reqId, hopOf(envelope));
+        try {
+          await writeRes(reqId, { ok: false, error: text });
+        } catch {
+          // writeRes failing must not crash the watcher.
+        }
+        log(`fleet-v1 req ${reqId}: ${text}`);
+        return;
+      }
       await writeFile(claimedPath(reqId), daemonId, { mode: 0o600 }).catch(
         () => undefined,
       );
@@ -352,6 +371,8 @@ export async function server(input: PluginInput) {
           ...(hb.model !== "" ? { model: hb.model } : {}),
           ...(hb.status !== "" ? { status: hb.status } : {}),
           ...(hb.lastDone !== "" ? { lastDone: hb.lastDone } : {}),
+          role: hb.role,
+          ...(hb.parentID !== "" ? { parentID: hb.parentID } : {}),
           updatedAt: hb.updatedAt,
         });
       } else {
@@ -397,6 +418,9 @@ export async function server(input: PluginInput) {
       fleet_policy: makeFleetPolicyTool(deps),
       fleet_summary: makeFleetSummaryTool(deps),
       fleet_group: makeFleetGroupTool(deps),
+      fleet_claim_commander: makeFleetClaimCommanderTool(deps),
+      fleet_release_commander: makeFleetReleaseCommanderTool(deps),
+      fleet_tree: makeFleetTreeTool(deps),
     },
     event: async ({ event }: { event: unknown }) => {
       try {

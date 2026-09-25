@@ -66,7 +66,7 @@ export async function fleetAllowHandler(args: any, _context: any, _deps?: FleetT
     const id = typeof args?.sessionId === "string" ? args.sessionId.trim() : "";
     if (id === "") return "fleet_allow failed: sessionId must be a non-empty string";
     const list = await addCommander(id);
-    const policy = await getPolicy().catch(() => "accept");
+    const policy = await getPolicy().catch(() => "commander-only");
     return `allowed ${id} (policy=${policy}, allowlist=${list.length})`;
   } catch (err) {
     return `fleet_allow failed: ${toReadableError(err)}`;
@@ -80,7 +80,7 @@ export async function fleetBlockHandler(args: any, _context: any, _deps?: FleetT
     const id = typeof args?.sessionId === "string" ? args.sessionId.trim() : "";
     if (id === "") return "fleet_block failed: sessionId must be a non-empty string";
     const list = await removeCommander(id);
-    const policy = await getPolicy().catch(() => "accept");
+    const policy = await getPolicy().catch(() => "commander-only");
     return `blocked ${id} (policy=${policy}, allowlist=${list.length})`;
   } catch (err) {
     return `fleet_block failed: ${toReadableError(err)}`;
@@ -93,12 +93,12 @@ export async function fleetPolicyHandler(args: any, _context: any, _deps?: Fleet
   try {
     const raw = typeof args?.policy === "string" ? args.policy.trim() : "";
     if (raw === "") {
-      const cur = await getPolicy().catch(() => "accept");
+      const cur = await getPolicy().catch(() => "commander-only");
       const list = await listCommanders().catch(() => [] as string[]);
       return `policy=${cur} allowlist=${list.length}${list.length > 0 ? ` (${list.join(", ")})` : ""}`;
     }
-    if (raw !== "accept" && raw !== "hold" && raw !== "refuse") {
-      return `fleet_policy failed: policy must be accept|hold|refuse (got ${raw})`;
+    if (raw !== "accept" && raw !== "hold" && raw !== "refuse" && raw !== "commander-only") {
+      return `fleet_policy failed: policy must be commander-only|accept|hold|refuse (got ${raw})`;
     }
     const p = await setPolicy(raw);
     const list = await listCommanders().catch(() => [] as string[]);
@@ -179,9 +179,10 @@ export function makeFleetBlockTool(deps?: FleetToolDeps) {
 
 export function makeFleetPolicyTool(deps?: FleetToolDeps) {
   return tool({
-    description: "Get or set the fleet inbound policy (accept|hold|refuse).",
+    description:
+      "Get or set the fleet inbound policy (commander-only|accept|hold|refuse). Default is commander-only (P5 safe default).",
     args: {
-      policy: tool.schema.string().optional().describe("accept|hold|refuse; omit to read current"),
+      policy: tool.schema.string().optional().describe("commander-only|accept|hold|refuse; omit to read current"),
     },
     execute: async (args, context) => fleetPolicyHandler(args, context, deps),
   });

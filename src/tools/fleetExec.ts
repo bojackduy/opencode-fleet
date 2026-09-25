@@ -22,7 +22,7 @@ import { buildInjectText, parseFleetModel } from "../inbox.js";
 import { atomicWriteJson, cleanupReq, readRes, writeReq } from "../fileTransport.js";
 import type { FleetEnvelope } from "../fileTransport.js";
 import { notifyPath } from "../notify.js";
-import { canExec } from "../auth.js";
+import { canExecDetail, denyText } from "../auth.js";
 import { listRegistry } from "../registry.js";
 
 export interface FleetToolDeps {
@@ -159,11 +159,13 @@ export async function fleetExecHandler(args: any, context: any, deps?: FleetTool
     const abortOnBusy = args?.abortOnBusy === undefined ? true : args.abortOnBusy !== false;
     const selfId = selfIdOf(context);
     const signal = context?.abort as AbortSignal | undefined;
+    const force = args?.force === true;
 
-    // P4 auth gate: hold queues, refuse denies, allow keeps the fast path.
+    // P5 auth gate (role matrix): hold queues, deny renders readable text.
+    const freshForAuth = await listRegistry({ includeSelf: true }).catch(() => []);
     try {
-      const verdict = await canExec(selfId, sessionId);
-      if (verdict === "hold") {
+      const verdict = await canExecDetail(selfId, sessionId, freshForAuth, { force });
+      if (verdict.allowed === "hold") {
         const reqId = `exec-${Date.now()}-${randomSuffix()}`;
         const heldEnvelope = {
           reqId,
@@ -189,8 +191,8 @@ export async function fleetExecHandler(args: any, context: any, deps?: FleetTool
         }
         return `${sessionId} | held for approval, use fleet_allow`;
       }
-      if (verdict === false) {
-        return `fleet_exec denied: commander ${selfId || "(unknown)"} not allowed (use fleet_allow / fleet_policy)`;
+      if (verdict.allowed === false) {
+        return `fleet_exec ${denyText(verdict.reason)}`;
       }
     } catch {
       // auth never blocks on its own failure — fall through to exec.
@@ -211,6 +213,7 @@ export async function fleetExecHandler(args: any, context: any, deps?: FleetTool
       targetDaemonId: entry.daemonId,
       message,
       createdAt: Date.now(),
+      hop: 0,
       ...(typeof args?.agent === "string" && args.agent !== "" ? { agent: args.agent } : {}),
       ...(modelRaw !== undefined && modelRaw !== null && modelRaw !== "" ? { model: modelRaw } : {}),
       ...(typeof args?.variant === "string" && args.variant !== "" ? { variant: args.variant } : {}),
@@ -426,6 +429,10 @@ export function makeFleetExecTool(deps?: FleetToolDeps) {
         .boolean()
         .optional()
         .describe("On SessionBusyError, best-effort abort then retry once (default true)"),
+      force: tool.schema
+        .boolean()
+        .optional()
+        .describe("Override commander->commander deny (default false)"),
     },
     execute: async (args, context) => fleetExecHandler(args, context, deps),
   });

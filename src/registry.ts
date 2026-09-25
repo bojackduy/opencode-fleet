@@ -15,6 +15,7 @@ import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { withV1Marker } from "./v1.js";
+import type { Role } from "./roles.js";
 
 export interface RegistryEntry {
   sessionId: string;
@@ -31,6 +32,10 @@ export interface RegistryEntry {
   model?: string;
   status?: string;
   lastDone?: string;
+  /** P5 role. Entries without a role read as "peer" (see roleOf in roles.ts). */
+  role?: Role;
+  /** P5 parent session id (fork chain). Empty/absent = top-level session. */
+  parentID?: string;
 }
 
 /** Entries with updatedAt older than this are hidden by listRegistry. */

@@ -8,6 +8,7 @@
 
 import { tool } from "@opencode-ai/plugin";
 import { listRegistry } from "../registry.js";
+import { renderTree } from "./fleetRoles.js";
 
 export interface FleetToolDeps {
   // biome-ignore lint/suspicious/noExplicitAny: v1 plugin client is untyped at the boundary.
@@ -36,6 +37,8 @@ export async function fleetListHandler(
     const selfId = context?.sessionID ?? context?.sessionId;
     const entries = await listRegistry({ includeSelf, selfId });
     if (entries.length === 0) return "no workers registered";
+    // P5 hierarchy view: group by parentID (commanders top, workers nested).
+    if (args?.tree === true) return renderTree(entries, selfId);
     const now = Date.now();
     const lines = ["sessionId | daemonId | directory | summary | ageH"];
     for (const e of entries) {
@@ -59,6 +62,10 @@ export function makeFleetListTool(deps?: FleetToolDeps) {
         .boolean()
         .optional()
         .describe("Include the calling session in the list"),
+      tree: tool.schema
+        .boolean()
+        .optional()
+        .describe("Group by parentID: commanders at top, workers/forks nested, orphans last"),
     },
     execute: async (args, context) => fleetListHandler(args, context, deps),
   });

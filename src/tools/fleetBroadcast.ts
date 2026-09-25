@@ -19,7 +19,7 @@ import { DONE_FOOTER } from "../inbox.js";
 import { atomicWriteJson, cleanupReq, readRes, writeReq } from "../fileTransport.js";
 import type { FleetEnvelope } from "../fileTransport.js";
 import { notifyPath } from "../notify.js";
-import { canExec } from "../auth.js";
+import { canExecDetail, denyText } from "../auth.js";
 import { listRegistry } from "../registry.js";
 
 export interface FleetToolDeps {
@@ -91,14 +91,16 @@ export async function fleetBroadcastHandler(
     const timeoutMs = clampTimeoutMs(args?.timeoutMs);
     const selfId = selfIdOf(context);
     const signal = context?.abort as AbortSignal | undefined;
+    const force = args?.force === true;
 
-    // P4 auth gate: hold queues per target, refuse denies, allow fans out.
+    // P5 auth gate: broadcast-level check (from must be commander).
+    const freshAuth = await listRegistry({ includeSelf: true }).catch(() => []);
     try {
-      const verdict = await canExec(selfId, "broadcast");
-      if (verdict === false) {
-        return `fleet_broadcast denied: commander ${selfId || "(unknown)"} not allowed (use fleet_allow / fleet_policy)`;
+      const verdict = await canExecDetail(selfId, "broadcast", freshAuth, { force });
+      if (verdict.allowed === false) {
+        return `fleet_broadcast ${denyText(verdict.reason)}`;
       }
-      if (verdict === "hold") {
+      if (verdict.allowed === "hold") {
         const freshHold = await listRegistry({ includeSelf: true });
         const targetsHold = holdTargets(freshHold.map((e) => e.sessionId));
         if (targetsHold.length === 0) return "no workers registered";
@@ -172,6 +174,19 @@ export async function fleetBroadcastHandler(
     return results.map(formatResult).join("\n");
 
     async function sendToOne(targetSessionId: string, targetDaemonId: string): Promise<TargetResult> {
+      // P5 per-target role check (commander->commander needs force).
+      try {
+        const per = await canExecDetail(selfId, targetSessionId, fresh, { force });
+        if (per.allowed === "hold") {
+          await queueHeld(targetSessionId);
+          return { sessionId: targetSessionId, ok: false, error: "held for approval, use fleet_allow" };
+        }
+        if (per.allowed === false) {
+          return { sessionId: targetSessionId, ok: false, error: denyText(per.reason) };
+        }
+      } catch {
+        // auth never blocks on its own failure — fall through to send.
+      }
       const reqId = `req-${Date.now()}-${randomSuffix()}`;
       const envelope: FleetEnvelope = {
         reqId,
@@ -180,6 +195,7 @@ export async function fleetBroadcastHandler(
         targetDaemonId,
         message: ensureDoneInstruction(message),
         createdAt: Date.now(),
+        hop: 0,
         ...(typeof args?.agent === "string" && args.agent !== "" ? { agent: args.agent } : {}),
         ...(typeof args?.model === "string" && args.model !== "" ? { model: args.model } : {}),
         ...(typeof args?.variant === "string" && args.variant !== "" ? { variant: args.variant } : {}),
@@ -242,6 +258,10 @@ export function makeFleetBroadcastTool(deps?: FleetToolDeps) {
         .number()
         .optional()
         .describe("Per-target wait for the reply (default 60000, max 600000)"),
+      force: tool.schema
+        .boolean()
+        .optional()
+        .describe("Override commander->commander deny per target (default false)"),
     },
     execute: async (args, context) => fleetBroadcastHandler(args, context, deps),
   });
