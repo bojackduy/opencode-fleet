@@ -49,3 +49,5 @@ Workers reply via `.res.json`; commanders are auto-notified via `.notify.json`.
 ## License
 
 AGPL-3.0-or-later — see [LICENSE](./LICENSE).
+Original work by Duy Trinh (bojackduy), 2026. CI/publish pipeline adapted
+from [@bojackduy/opencode-loopd](https://github.com/bojackduy/opencode-loopd).
