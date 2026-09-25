@@ -76,6 +76,30 @@ export function withV1Marker(daemonId: string): string {
   }
 }
 
+/** Strip a trailing `:v1` / `#v1` marker for daemon comparisons. Never throws. */
+export function stripV1Marker(daemonId: unknown): string {
+  try {
+    return String(daemonId ?? "").replace(/:v1$|#v1$/, "");
+  } catch {
+    return String(daemonId ?? "");
+  }
+}
+
+/**
+ * Marker-insensitive daemon equality: the registry stores `:v1`-marked ids
+ * while watchers hold the raw `getDaemonId()` value — compare stripped.
+ * Never throws.
+ */
+export function sameDaemon(a: unknown, b: unknown): boolean {
+  try {
+    const x = stripV1Marker(a);
+    const y = stripV1Marker(b);
+    return x !== "" && x === y;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Guard for registry daemonIds: true when the id is not a known v2 marker
  * (`.bun` path or the 49374 service port).
@@ -84,10 +108,37 @@ export function isV1DaemonId(daemonId: unknown): boolean {
   try {
     const s = String(daemonId ?? "");
     if (s === "") return false;
+    if (s.startsWith("v2:")) return false;
     if (s.includes(".bun")) return false;
     if (s.includes(V2_SERVICE_PORT)) return false;
     return true;
   } catch {
     return false;
+  }
+}
+
+/** True when a daemonId belongs to a v2 runtime (`v2:` prefix or legacy markers). */
+export function isV2DaemonId(daemonId: unknown): boolean {
+  try {
+    const s = String(daemonId ?? "");
+    if (s === "") return false;
+    if (s.startsWith("v2:")) return true;
+    if (s.includes(".bun")) return true;
+    if (s.includes(V2_SERVICE_PORT)) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Route a daemonId to its runtime (part 2): v2 markers (`.bun`/49374/`v2:`)
+ * route to the v2 transport instead of being skipped. Never throws.
+ */
+export function runtimeOfDaemonId(daemonId: unknown): "v1" | "v2" {
+  try {
+    return isV2DaemonId(daemonId) ? "v2" : "v1";
+  } catch {
+    return "v1";
   }
 }

@@ -17,17 +17,21 @@
 
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { tool } from "@opencode-ai/plugin";
+import { depsOf, z } from "../toolDef.js";
+import type { ToolDef } from "../toolDef.js";
+import type { Runtime } from "../runtime.js";
 import { buildInjectText, DONE_FOOTER } from "../inbox.js";
 import { chainRefsOf, hopOf, isHopExceeded, loopGuardText, messagesDir, readReq, writeReq } from "../fileTransport.js";
 import type { FleetEnvelope } from "../fileTransport.js";
-import { listRegistry } from "../registry.js";
+import { listRegistry, runtimeOf } from "../registry.js";
 import { readNotify } from "../notify.js";
+import { passwordForUrl, v2PromptRemote } from "../v2transport.js";
 
 export interface FleetToolDeps {
   // biome-ignore lint/suspicious/noExplicitAny: v1 plugin client is untyped at the boundary.
   client?: any;
   serverUrl?: string | URL;
+  rt?: Runtime;
 }
 
 export const DEFAULT_THREAD_LIMIT = 10;
@@ -133,12 +137,21 @@ export async function fleetHandoffBackHandler(
       return `fleet_handoff_back failed: inbound req ${inbound.reqId} has no fromCommander`;
     }
 
-    // Resolve the commander's daemon for the spool fallback.
+    // Resolve the commander's daemon + runtime for the transport choice.
     let targetDaemonId: string | undefined;
+    let commanderRuntime: "v1" | "v2" = "v1";
+    let commanderUrl = "";
     try {
       const fresh = await listRegistry({ includeSelf: true });
       const entry = fresh.find((e) => e.sessionId === commanderId);
-      if (entry) targetDaemonId = entry.daemonId;
+      if (entry) {
+        targetDaemonId = entry.daemonId;
+        commanderRuntime = runtimeOf(entry);
+        if (typeof entry.endpoint?.url === "string") commanderUrl = entry.endpoint.url.trim();
+        if (commanderUrl === "" && entry.daemonId.startsWith("v2:")) {
+          commanderUrl = entry.daemonId.slice("v2:".length);
+        }
+      }
     } catch {
       // registry is best-effort; spool still works without targetDaemonId.
     }
@@ -170,6 +183,30 @@ export async function fleetHandoffBackHandler(
       ...(typeof args?.variant === "string" && args.variant !== "" ? { variant: args.variant } : {}),
     };
     const inject = buildInjectText(envelope);
+    const rt = deps?.rt;
+
+    // Part 2 transports by TARGET (commander) runtime, fire-and-forget:
+    // (1) same v2 process → in-process promptLocal (lands as user bubble);
+    // (2) remote v2 service → HTTP prompt; (3) v1 same-daemon → promptAsync;
+    // (4) spool fallback (claimed by the owning daemon's watcher).
+    if (commanderRuntime === "v2" && rt?.kind === "v2" && targetDaemonId !== undefined && rt.daemonId === targetDaemonId) {
+      try {
+        await rt.promptLocal(commanderId, inject);
+        return `handed back to ${commanderId} via:in-process (req ${reqId} Re: ${inbound.reqId})`;
+      } catch {
+        // fall through to remote/spool
+      }
+    }
+    if (commanderRuntime === "v2" && commanderUrl !== "" && !commanderUrl.startsWith("pid:")) {
+      try {
+        const pw = await passwordForUrl(commanderUrl).catch(() => "");
+        if (pw !== "" && (await v2PromptRemote(commanderUrl, pw, commanderId, inject))) {
+          return `handed back to ${commanderId} via:v2-http (req ${reqId} Re: ${inbound.reqId})`;
+        }
+      } catch {
+        // fall through to spool
+      }
+    }
 
     // DIRECT first when the client can reach the commander live.
     if (client?.session?.promptAsync) {
@@ -301,49 +338,47 @@ export async function fleetThreadHandler(
   }
 }
 
-export function makeFleetHandoffBackTool(deps?: FleetToolDeps) {
-  return tool({
-    description:
-      "Hand a delegation back to the commander that sent it (reverse delegation via direct promptAsync with spool fallback). Returns who it handed back to and via which path.",
-    args: {
-      message: tool.schema
-        .string()
-        .describe("Correction / follow-up for the commander (self-contained, plain text)"),
-      done: tool.schema
-        .string()
-        .optional()
-        .describe("Suggested one-line DONE: result for the commander"),
-      agent: tool.schema.string().optional().describe("Optional agent hint replayed on the commander"),
-      model: tool.schema
-        .union([
-          tool.schema.string(),
-          tool.schema.object({
-            providerID: tool.schema.string(),
-            modelID: tool.schema.string(),
-          }),
-        ])
-        .optional()
-        .describe('Optional model hint ("provider/model" or {providerID, modelID})'),
-      variant: tool.schema.string().optional().describe("Optional variant hint replayed on the commander"),
-    },
-    execute: async (args, context) => fleetHandoffBackHandler(args, context, deps),
-  });
-}
+export const fleetHandoffBackDef: ToolDef = {
+  name: "fleet_handoff_back",
+  description:
+    "Hand a delegation back to the commander that sent it (reverse delegation via direct promptAsync with spool fallback). Returns who it handed back to and via which path.",
+  args: {
+    message: z
+      .string()
+      .describe("Correction / follow-up for the commander (self-contained, plain text)"),
+    done: z
+      .string()
+      .optional()
+      .describe("Suggested one-line DONE: result for the commander"),
+    agent: z.string().optional().describe("Optional agent hint replayed on the commander"),
+    model: z
+      .union([
+        z.string(),
+        z.object({
+          providerID: z.string(),
+          modelID: z.string(),
+        }),
+      ])
+      .optional()
+      .describe('Optional model hint ("provider/model" or {providerID, modelID})'),
+    variant: z.string().optional().describe("Optional variant hint replayed on the commander"),
+  },
+  run: (args, callCtx, rt) => fleetHandoffBackHandler(args, callCtx, depsOf(rt)),
+};
 
-export function makeFleetThreadTool(deps?: FleetToolDeps) {
-  return tool({
-    description:
-      "List a fleet thread (.req/.res/.notify triples) as a compact reqId|from->to|done|snippet table. Filter by reqId or Re: thread ref.",
-    args: {
-      reqId: tool.schema
-        .string()
-        .optional()
-        .describe("Thread filter: exact/prefix reqId or the Re: ref (omit for all, newest-capped)"),
-      limit: tool.schema
-        .number()
-        .optional()
-        .describe("Max rows (default 10, max 50)"),
-    },
-    execute: async (args, context) => fleetThreadHandler(args, context, deps),
-  });
-}
+export const fleetThreadDef: ToolDef = {
+  name: "fleet_thread",
+  description:
+    "List a fleet thread (.req/.res/.notify triples) as a compact reqId|from->to|done|snippet table. Filter by reqId or Re: thread ref.",
+  args: {
+    reqId: z
+      .string()
+      .optional()
+      .describe("Thread filter: exact/prefix reqId or the Re: ref (omit for all, newest-capped)"),
+    limit: z
+      .number()
+      .optional()
+      .describe("Max rows (default 10, max 50)"),
+  },
+  run: (args, callCtx, rt) => fleetThreadHandler(args, callCtx, depsOf(rt)),
+};

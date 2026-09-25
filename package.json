@@ -5,6 +5,10 @@
   "description": "Lightweight orchestrator → workers for OpenCode v1 (file spool + prompt_async, takeover-friendly).",
   "type": "module",
   "main": "dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./server": "./dist/index.js"
+  },
   "license": "AGPL-3.0-or-later",
   "private": false,
   "author": "bojackduy",
@@ -27,6 +31,7 @@
   ],
   "files": [
     "dist",
+    "index.js",
     "README.md",
     "LICENSE",
     "CHANGELOG.md"

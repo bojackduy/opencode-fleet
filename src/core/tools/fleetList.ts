@@ -6,7 +6,8 @@
  * returned as readable text.
  */
 
-import { tool } from "@opencode-ai/plugin";
+import { depsOf, z } from "../toolDef.js";
+import type { ToolDef } from "../toolDef.js";
 import { listRegistry } from "../registry.js";
 import { renderTree } from "./fleetRoles.js";
 
@@ -53,20 +54,19 @@ export async function fleetListHandler(
   }
 }
 
-export function makeFleetListTool(deps?: FleetToolDeps) {
-  return tool({
-    description:
-      "List registered fleet worker sessions (entries older than 24h are hidden). Excludes self unless includeSelf is true.",
-    args: {
-      includeSelf: tool.schema
-        .boolean()
-        .optional()
-        .describe("Include the calling session in the list"),
-      tree: tool.schema
-        .boolean()
-        .optional()
-        .describe("Group by parentID: commanders at top, workers/forks nested, orphans last"),
-    },
-    execute: async (args, context) => fleetListHandler(args, context, deps),
-  });
-}
+export const fleetListDef: ToolDef = {
+  name: "fleet_list",
+  description:
+    "List registered fleet worker sessions (entries older than 24h are hidden). Excludes self unless includeSelf is true.",
+  args: {
+    includeSelf: z
+      .boolean()
+      .optional()
+      .describe("Include the calling session in the list"),
+    tree: z
+      .boolean()
+      .optional()
+      .describe("Group by parentID: commanders at top, workers/forks nested, orphans last"),
+  },
+  run: (args, callCtx, rt) => fleetListHandler(args, callCtx, depsOf(rt)),
+};

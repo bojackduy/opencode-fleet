@@ -5,7 +5,8 @@
  * failures render as readable text.
  */
 
-import { tool } from "@opencode-ai/plugin";
+import { depsOf, z } from "../toolDef.js";
+import type { ToolDef } from "../toolDef.js";
 import { discoverSessionsPreferApi, fleetPs } from "../discover.js";
 
 export interface FleetToolDeps {
@@ -89,22 +90,20 @@ export async function fleetPsHandler(_args: any, _context: any, _deps?: FleetToo
   }
 }
 
-export function makeFleetDiscoverTool(deps?: FleetToolDeps) {
-  return tool({
-    description:
-      "Discover v1 sessions from the shared sqlite DB joined with the fleet registry (read-only, newest first).",
-    args: {
-      limit: tool.schema.number().optional().describe("Max sessions to show (default 15)"),
-    },
-    execute: async (args, context) => fleetDiscoverHandler(args, context, deps),
-  });
-}
+export const fleetDiscoverDef: ToolDef = {
+  name: "fleet_discover",
+  description:
+    "Discover v1 sessions from the shared sqlite DB joined with the fleet registry (read-only, newest first).",
+  args: {
+    limit: z.number().optional().describe("Max sessions to show (default 15)"),
+  },
+  run: (args, callCtx, rt) => fleetDiscoverHandler(args, callCtx, depsOf(rt)),
+};
 
-export function makeFleetPsTool(deps?: FleetToolDeps) {
-  return tool({
-    description:
-      "Show fleet processes merged from ps/lsof + sqlite + registry with pid/port hints (read-only, v1 only).",
-    args: {},
-    execute: async (args, context) => fleetPsHandler(args, context, deps),
-  });
-}
+export const fleetPsDef: ToolDef = {
+  name: "fleet_ps",
+  description:
+    "Show fleet processes merged from ps/lsof + sqlite + registry with pid/port hints (read-only, v1 only).",
+  args: {},
+  run: (args, callCtx, rt) => fleetPsHandler(args, callCtx, depsOf(rt)),
+};

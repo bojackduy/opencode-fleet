@@ -14,18 +14,22 @@
  *   turn stops the wait promptly.
  */
 
-import { tool } from "@opencode-ai/plugin";
-import { DONE_FOOTER } from "../inbox.js";
+import { depsOf, z } from "../toolDef.js";
+import type { ToolDef } from "../toolDef.js";
+import type { Runtime } from "../runtime.js";
+import { DONE_FOOTER, buildInjectText } from "../inbox.js";
 import { atomicWriteJson, cleanupReq, readRes, writeReq } from "../fileTransport.js";
 import type { FleetEnvelope } from "../fileTransport.js";
 import { notifyPath } from "../notify.js";
 import { canExecDetail, denyText } from "../auth.js";
-import { listRegistry } from "../registry.js";
+import { listRegistry, runtimeOf } from "../registry.js";
+import type { RegistryEntry } from "../registry.js";
 
 export interface FleetToolDeps {
   // biome-ignore lint/suspicious/noExplicitAny: v1 plugin client is untyped at the boundary.
   client?: any;
   serverUrl?: string | URL;
+  rt?: Runtime;
 }
 
 export const DEFAULT_BROADCAST_TIMEOUT_MS = 60_000;
@@ -84,7 +88,6 @@ export async function fleetBroadcastHandler(
   context: any,
   deps?: FleetToolDeps,
 ): Promise<string> {
-  void deps;
   try {
     const message = typeof args?.message === "string" ? args.message : "";
     if (message.trim() === "") return "fleet_broadcast failed: message must be a non-empty string";
@@ -92,6 +95,7 @@ export async function fleetBroadcastHandler(
     const selfId = selfIdOf(context);
     const signal = context?.abort as AbortSignal | undefined;
     const force = args?.force === true;
+    const rt = deps?.rt;
 
     // P5 auth gate: broadcast-level check (from must be commander).
     const freshAuth = await listRegistry({ includeSelf: true }).catch(() => []);
@@ -159,7 +163,7 @@ export async function fleetBroadcastHandler(
     if (!only) {
       const defaults = fresh.filter((e) => e.sessionId !== selfId);
       if (defaults.length === 0) return "no workers registered";
-      return (await Promise.all(defaults.map((e) => sendToOne(e.sessionId, e.daemonId)))).map(
+      return (await Promise.all(defaults.map((e) => sendToOne(e)))).map(
         formatResult,
       ).join("\n");
     }
@@ -168,12 +172,14 @@ export async function fleetBroadcastHandler(
       only.map(async (id): Promise<TargetResult> => {
         const entry = byId.get(id);
         if (!entry) return { sessionId: id, ok: false, error: "not in registry" };
-        return sendToOne(entry.sessionId, entry.daemonId);
+        return sendToOne(entry);
       }),
     );
     return results.map(formatResult).join("\n");
 
-    async function sendToOne(targetSessionId: string, targetDaemonId: string): Promise<TargetResult> {
+    async function sendToOne(entry: RegistryEntry): Promise<TargetResult> {
+      const targetSessionId = entry.sessionId;
+      const targetDaemonId = entry.daemonId;
       // P5 per-target role check (commander->commander needs force).
       try {
         const per = await canExecDetail(selfId, targetSessionId, fresh, { force });
@@ -201,6 +207,30 @@ export async function fleetBroadcastHandler(
         ...(typeof args?.variant === "string" && args.variant !== "" ? { variant: args.variant } : {}),
         ...(typeof args?.system === "string" && args.system !== "" ? { system: args.system } : {}),
       };
+      // Part 2 fast path: same v2 process → in-process prompt + DONE poll.
+      // Anything else (incl. v2 commander→v1 and v1→v2) goes through the spool,
+      // which the owning daemon's watcher claims as a normal user message.
+      if (rt?.kind === "v2" && runtimeOf(entry) === "v2" && rt.daemonId === entry.daemonId) {
+        try {
+          const since = Date.now();
+          await rt.promptLocal(targetSessionId, buildInjectText(envelope), {
+            ...(envelope.agent ? { agent: envelope.agent } : {}),
+            ...(envelope.model ? { model: envelope.model } : {}),
+            ...(envelope.variant ? { variant: envelope.variant } : {}),
+            ...(envelope.system ? { system: envelope.system } : {}),
+          });
+          let reply: string | null = null;
+          try {
+            reply = (await rt.waitForDone?.(targetSessionId, since, timeoutMs, signal)) ?? null;
+          } catch {
+            reply = null;
+          }
+          if (reply !== null) return { sessionId: targetSessionId, ok: true, reply };
+          return { sessionId: targetSessionId, ok: true, reply: "injected via in-process; DONE poll unavailable" };
+        } catch (err) {
+          return { sessionId: targetSessionId, ok: false, error: `in-process failed: ${toReadableError(err)}` };
+        }
+      }
       try {
         await writeReq(reqId, envelope);
       } catch (err) {
@@ -235,34 +265,33 @@ export async function fleetBroadcastHandler(
   }
 }
 
-export function makeFleetBroadcastTool(deps?: FleetToolDeps) {
-  return tool({
-    description:
-      "Broadcast a self-contained task to fleet workers and wait for their DONE: replies. Returns one result line per target worker.",
-    args: {
-      message: tool.schema
-        .string()
-        .describe("Self-contained task (goal + files + constraints + done criteria)"),
-      only: tool.schema
-        .array(tool.schema.string())
-        .optional()
-        .describe("Target session ids; defaults to all registered workers except self"),
-      agent: tool.schema.string().optional().describe("Optional agent hint replayed by the worker"),
-      model: tool.schema
-        .string()
-        .optional()
-        .describe('Optional model hint ("provider/model") replayed by the worker'),
-      variant: tool.schema.string().optional().describe("Optional variant hint replayed by the worker"),
-      system: tool.schema.string().optional().describe("Optional system prompt replayed by the worker"),
-      timeoutMs: tool.schema
-        .number()
-        .optional()
-        .describe("Per-target wait for the reply (default 60000, max 600000)"),
-      force: tool.schema
-        .boolean()
-        .optional()
-        .describe("Override commander->commander deny per target (default false)"),
-    },
-    execute: async (args, context) => fleetBroadcastHandler(args, context, deps),
-  });
-}
+export const fleetBroadcastDef: ToolDef = {
+  name: "fleet_broadcast",
+  description:
+    "Broadcast a self-contained task to fleet workers and wait for their DONE: replies. Returns one result line per target worker.",
+  args: {
+    message: z
+      .string()
+      .describe("Self-contained task (goal + files + constraints + done criteria)"),
+    only: z
+      .array(z.string())
+      .optional()
+      .describe("Target session ids; defaults to all registered workers except self"),
+    agent: z.string().optional().describe("Optional agent hint replayed by the worker"),
+    model: z
+      .string()
+      .optional()
+      .describe('Optional model hint ("provider/model") replayed by the worker'),
+    variant: z.string().optional().describe("Optional variant hint replayed by the worker"),
+    system: z.string().optional().describe("Optional system prompt replayed by the worker"),
+    timeoutMs: z
+      .number()
+      .optional()
+      .describe("Per-target wait for the reply (default 60000, max 600000)"),
+    force: z
+      .boolean()
+      .optional()
+      .describe("Override commander->commander deny per target (default false)"),
+  },
+  run: (args, callCtx, rt) => fleetBroadcastHandler(args, callCtx, depsOf(rt)),
+};

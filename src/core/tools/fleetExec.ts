@@ -17,18 +17,23 @@
  * Never throws — all failures render as readable text.
  */
 
-import { tool } from "@opencode-ai/plugin";
+import { depsOf, z } from "../toolDef.js";
+import type { ToolDef } from "../toolDef.js";
+import type { Runtime } from "../runtime.js";
 import { buildInjectText, parseFleetModel } from "../inbox.js";
 import { atomicWriteJson, cleanupReq, readRes, writeReq } from "../fileTransport.js";
 import type { FleetEnvelope } from "../fileTransport.js";
 import { notifyPath } from "../notify.js";
 import { canExecDetail, denyText } from "../auth.js";
-import { listRegistry } from "../registry.js";
+import { listRegistry, runtimeOf } from "../registry.js";
+import type { RegistryEntry } from "../registry.js";
+import { passwordForUrl, pollV2Done, v2PromptRemote } from "../v2transport.js";
 
 export interface FleetToolDeps {
   // biome-ignore lint/suspicious/noExplicitAny: v1 plugin client is untyped at the boundary.
   client?: any;
   serverUrl?: string | URL;
+  rt?: Runtime;
 }
 
 export const DEFAULT_EXEC_TIMEOUT_MS = 60_000;
@@ -222,6 +227,12 @@ export async function fleetExecHandler(args: any, context: any, deps?: FleetTool
     const inject = buildInjectText(envelope);
     const parsedModel = parseFleetModel(envelope.model);
 
+    // Part 2: route by TARGET row runtime. v2 targets go in-process (same v2
+    // daemon) → remote v2 HTTP → spool; v1 targets keep the v1 direct path.
+    if (runtimeOf(entry) === "v2") {
+      return await execToV2(sessionId, entry, envelope, inject, timeoutMs, signal, deps);
+    }
+
     if (mode === "direct") {
       const direct = await tryDirect(client, sessionId, inject, envelope, timeoutMs, abortOnBusy, signal);
       if (direct.ok) return direct.text;
@@ -235,6 +246,85 @@ export async function fleetExecHandler(args: any, context: any, deps?: FleetTool
   } catch (err) {
     return `fleet_exec failed: ${toReadableError(err)}`;
   }
+}
+
+/**
+ * Part 2 delegation to a v2 target, by transport priority:
+ * 1. Same v2 process (target daemonId equals self): in-process promptLocal.
+ * 2. Remote v2 service: POST {url}/api/session/{id}/prompt (Basic from
+ *    service.json at send time) + DONE poll over the message list.
+ * 3. File-spool fallback (claimed by the v2 watcher's process singleton).
+ * Each lands as a normal user message; the worker replies with DONE:.
+ * Once injected via 1/2, never spool (that would double-deliver).
+ */
+async function execToV2(
+  sessionId: string,
+  entry: RegistryEntry,
+  envelope: FleetEnvelope,
+  inject: string,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+  deps?: FleetToolDeps,
+): Promise<string> {
+  const rt = deps?.rt;
+  // 1. Same v2 process.
+  if (rt?.kind === "v2" && rt.daemonId === entry.daemonId) {
+    const since = Date.now();
+    try {
+      await rt.promptLocal(sessionId, inject, {
+        ...(envelope.agent ? { agent: envelope.agent } : {}),
+        ...(envelope.model ? { model: envelope.model } : {}),
+        ...(envelope.variant ? { variant: envelope.variant } : {}),
+        ...(envelope.system ? { system: envelope.system } : {}),
+      });
+    } catch {
+      return await spoolFallback(sessionId, envelope, timeoutMs, signal);
+    }
+    let reply: string | null = null;
+    try {
+      reply = (await rt.waitForDone?.(sessionId, since, timeoutMs, signal)) ?? null;
+    } catch {
+      reply = null;
+    }
+    if (signal?.aborted) return `${sessionId} | via:in-process | error: aborted`;
+    if (reply === null) {
+      return `${sessionId} | via:in-process | ok | injected; DONE poll unavailable (no service credentials)`;
+    }
+    const done = doneLineOf(reply);
+    if (done === null || done.trim() === "") {
+      return `${sessionId} | via:in-process | error: no trailing DONE: line found`;
+    }
+    return `${sessionId} | via:in-process | ok | DONE:${done.trim()} | ${snippetOf(reply)}`;
+  }
+  // 2. Remote v2 service (endpoint url, else the v2: daemonId suffix).
+  const url =
+    (typeof entry.endpoint?.url === "string" && entry.endpoint.url.trim() !== ""
+      ? entry.endpoint.url.trim()
+      : entry.daemonId.startsWith("v2:")
+        ? entry.daemonId.slice("v2:".length)
+        : "") ?? "";
+  if (url !== "" && !url.startsWith("pid:")) {
+    const pw = await passwordForUrl(url).catch(() => "");
+    if (pw !== "") {
+      const since = Date.now();
+      const accepted = await v2PromptRemote(url, pw, sessionId, inject);
+      if (accepted) {
+        const reply = await pollV2Done(url, pw, sessionId, since, timeoutMs, signal);
+        if (reply === null) {
+          if (signal?.aborted) return `${sessionId} | via:v2-http | error: aborted`;
+          return `${sessionId} | via:v2-http | error: timeout after ${timeoutMs}ms waiting for DONE: reply`;
+        }
+        const done = doneLineOf(reply);
+        if (done === null || done.trim() === "") {
+          return `${sessionId} | via:v2-http | error: no trailing DONE: line found`;
+        }
+        return `${sessionId} | via:v2-http | ok | DONE:${done.trim()} | ${snippetOf(reply)}`;
+      }
+      // Prompt rejected (unknown session/standalone) → spool fallback below.
+    }
+  }
+  // 3. Spool (v2 commander→v1 worker and v1 commander→v2 worker also land here).
+  return await spoolFallback(sessionId, envelope, timeoutMs, signal);
 }
 
 async function tryDirect(
@@ -395,45 +485,44 @@ async function spoolFallback(
   }
 }
 
-export function makeFleetExecTool(deps?: FleetToolDeps) {
-  return tool({
-    description:
-      "Execute a self-contained task on one fleet worker fast via direct promptAsync, falling back to file-spool when the owning daemon is asleep. Returns sessionId | via | ok | DONE line | snippet.",
-    args: {
-      sessionId: tool.schema.string().describe("Target worker session id (must be in registry)"),
-      message: tool.schema
-        .string()
-        .describe("Self-contained task (goal + files + constraints + done criteria)"),
-      agent: tool.schema.string().optional().describe("Optional agent hint replayed on the target"),
-      model: tool.schema
-        .union([
-          tool.schema.string(),
-          tool.schema.object({
-            providerID: tool.schema.string(),
-            modelID: tool.schema.string(),
-          }),
-        ])
-        .optional()
-        .describe('Optional model hint ("provider/model" or {providerID, modelID})'),
-      variant: tool.schema.string().optional().describe("Optional variant hint replayed on the target"),
-      system: tool.schema.string().optional().describe("Optional system prompt replayed on the target"),
-      timeoutMs: tool.schema
-        .number()
-        .optional()
-        .describe("Wait for the DONE: reply (default 60000, max 600000)"),
-      mode: tool.schema
-        .union([tool.schema.literal("direct"), tool.schema.literal("spool")])
-        .optional()
-        .describe('Exec mode: "direct" (default, with spool fallback) or "spool" (spool only)'),
-      abortOnBusy: tool.schema
-        .boolean()
-        .optional()
-        .describe("On SessionBusyError, best-effort abort then retry once (default true)"),
-      force: tool.schema
-        .boolean()
-        .optional()
-        .describe("Override commander->commander deny (default false)"),
-    },
-    execute: async (args, context) => fleetExecHandler(args, context, deps),
-  });
-}
+export const fleetExecDef: ToolDef = {
+  name: "fleet_exec",
+  description:
+    "Execute a self-contained task on one fleet worker fast via direct promptAsync, falling back to file-spool when the owning daemon is asleep. Returns sessionId | via | ok | DONE line | snippet.",
+  args: {
+    sessionId: z.string().describe("Target worker session id (must be in registry)"),
+    message: z
+      .string()
+      .describe("Self-contained task (goal + files + constraints + done criteria)"),
+    agent: z.string().optional().describe("Optional agent hint replayed on the target"),
+    model: z
+      .union([
+        z.string(),
+        z.object({
+          providerID: z.string(),
+          modelID: z.string(),
+        }),
+      ])
+      .optional()
+      .describe('Optional model hint ("provider/model" or {providerID, modelID})'),
+    variant: z.string().optional().describe("Optional variant hint replayed on the target"),
+    system: z.string().optional().describe("Optional system prompt replayed on the target"),
+    timeoutMs: z
+      .number()
+      .optional()
+      .describe("Wait for the DONE: reply (default 60000, max 600000)"),
+    mode: z
+      .union([z.literal("direct"), z.literal("spool")])
+      .optional()
+      .describe('Exec mode: "direct" (default, with spool fallback) or "spool" (spool only)'),
+    abortOnBusy: z
+      .boolean()
+      .optional()
+      .describe("On SessionBusyError, best-effort abort then retry once (default true)"),
+    force: z
+      .boolean()
+      .optional()
+      .describe("Override commander->commander deny (default false)"),
+  },
+  run: (args, callCtx, rt) => fleetExecHandler(args, callCtx, depsOf(rt)),
+};

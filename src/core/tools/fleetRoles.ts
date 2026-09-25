@@ -5,10 +5,11 @@
  * Claim/release mutate the auth.json commander allowlist (+ stamp the
  * registry role) via roles.ts. Tree renders the parentID hierarchy:
  * commanders at top, their workers/forks nested, orphans last.
- * All tools are v1 tool() and never throw — failures render as readable text.
+ * All tools are runtime-agnostic ToolDefs and never throw — failures render as readable text.
  */
 
-import { tool } from "@opencode-ai/plugin";
+import { depsOf, z } from "../toolDef.js";
+import type { ToolDef } from "../toolDef.js";
 import { listRegistry } from "../registry.js";
 import type { RegistryEntry } from "../registry.js";
 import { claimCommander, releaseCommander, roleOf } from "../roles.js";
@@ -184,39 +185,36 @@ export async function fleetTreeHandler(
   }
 }
 
-export function makeFleetClaimCommanderTool(deps?: FleetToolDeps) {
-  return tool({
-    description:
-      "Claim commander role for a session (defaults to self): adds to the auth allowlist + stamps the registry role.",
-    args: {
-      sessionId: tool.schema
-        .string()
-        .optional()
-        .describe("Session id to promote (defaults to the calling session)"),
-    },
-    execute: async (args, context) => fleetClaimCommanderHandler(args, context, deps),
-  });
-}
+export const fleetClaimCommanderDef: ToolDef = {
+  name: "fleet_claim_commander",
+  description:
+    "Claim commander role for a session (defaults to self): adds to the auth allowlist + stamps the registry role.",
+  args: {
+    sessionId: z
+      .string()
+      .optional()
+      .describe("Session id to promote (defaults to the calling session)"),
+  },
+  run: (args, callCtx, rt) => fleetClaimCommanderHandler(args, callCtx, depsOf(rt)),
+};
 
-export function makeFleetReleaseCommanderTool(deps?: FleetToolDeps) {
-  return tool({
-    description:
-      "Release commander role for a session (defaults to self): removes from the auth allowlist + stamps the registry role back to peer.",
-    args: {
-      sessionId: tool.schema
-        .string()
-        .optional()
-        .describe("Session id to demote (defaults to the calling session)"),
-    },
-    execute: async (args, context) => fleetReleaseCommanderHandler(args, context, deps),
-  });
-}
+export const fleetReleaseCommanderDef: ToolDef = {
+  name: "fleet_release_commander",
+  description:
+    "Release commander role for a session (defaults to self): removes from the auth allowlist + stamps the registry role back to peer.",
+  args: {
+    sessionId: z
+      .string()
+      .optional()
+      .describe("Session id to demote (defaults to the calling session)"),
+  },
+  run: (args, callCtx, rt) => fleetReleaseCommanderHandler(args, callCtx, depsOf(rt)),
+};
 
-export function makeFleetTreeTool(deps?: FleetToolDeps) {
-  return tool({
-    description:
-      "Show the fleet hierarchy grouped by parentID: commanders at top with workers/forks nested, orphans last.",
-    args: {},
-    execute: async (args, context) => fleetTreeHandler(args, context, deps),
-  });
-}
+export const fleetTreeDef: ToolDef = {
+  name: "fleet_tree",
+  description:
+    "Show the fleet hierarchy grouped by parentID: commanders at top with workers/forks nested, orphans last.",
+  args: {},
+  run: (args, callCtx, rt) => fleetTreeHandler(args, callCtx, depsOf(rt)),
+};

@@ -46,6 +46,44 @@ Reply ending with exactly: DONE:<one-line-result>
 
 Workers reply via `.res.json`; commanders are auto-notified via `.notify.json`.
 
+## OpenCode v2
+
+The same entry line works in **both** runtimes (minimum v2 `2.0.16`): v2
+migrates the v1 `plugin` list and loads the dual-shape `dist/index.js`
+(`{ id, server, setup }` — v1 runs `server`, v2 runs `setup`).
+
+```jsonc
+// already have this? nothing to add — it loads on v2 too.
+{ "plugin": ["file:/Users/duytrinh/Code/opencode-fleet-v1"] }
+```
+
+Otherwise:
+
+```sh
+opencode2 plugin add @bojackduy/opencode-fleet-v1
+```
+
+```jsonc
+// opencode.jsonc (v2 shape)
+{ "plugins": ["@bojackduy/opencode-fleet-v1"] }
+```
+
+Caveats:
+
+- Do **not** point a v2 `plugins` entry at a file path (`…/dist/index.js`
+  is rejected — "must be a directory"). Use the package spec above, or an
+  absolute directory that contains `server.*`/`index.*` at its root.
+- All 19 `fleet_*` tools register natively per location; identity is the
+  calling `sessionID`. Delegation routes by the target row's `runtime`:
+  same-process in-process prompt → remote v2 HTTP (`POST
+  {url}/api/session/{id}/prompt`, password read from
+  `state/opencode/service.json` only on URL match at send time, never
+  logged/persisted/registered) → file-spool fallback, which is also the
+  universal v1↔v2 path. Every delegation still lands as a normal user
+  message ending in a `DONE:` reply.
+- v1 behaviour is unchanged (v1 pin `@opencode-ai/plugin 1.18.32` kept for
+  v1 paths; v2 uses structural types only).
+
 ## License
 
 AGPL-3.0-or-later — see [LICENSE](./LICENSE).

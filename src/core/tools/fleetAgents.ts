@@ -5,7 +5,8 @@
  * hint to check the TUI `/agent` and `/model` pickers. Never throws.
  */
 
-import { tool } from "@opencode-ai/plugin";
+import { depsOf, z } from "../toolDef.js";
+import type { ToolDef } from "../toolDef.js";
 
 export interface FleetToolDeps {
   // biome-ignore lint/suspicious/noExplicitAny: v1 plugin client is untyped at the boundary.
@@ -83,18 +84,16 @@ export async function fleetModelsHandler(
   }
 }
 
-export function makeFleetAgentsTool(deps?: FleetToolDeps) {
-  return tool({
-    description: "List agents available to fleet workers (falls back to a TUI hint).",
-    args: {},
-    execute: async (args, context) => fleetAgentsHandler(args, context, deps),
-  });
-}
+export const fleetAgentsDef: ToolDef = {
+  name: "fleet_agents",
+  description: "List agents available to fleet workers (falls back to a TUI hint).",
+  args: {},
+  run: (args, callCtx, rt) => fleetAgentsHandler(args, callCtx, depsOf(rt)),
+};
 
-export function makeFleetModelsTool(deps?: FleetToolDeps) {
-  return tool({
-    description: "List models available to fleet workers (falls back to a TUI hint).",
-    args: {},
-    execute: async (args, context) => fleetModelsHandler(args, context, deps),
-  });
-}
+export const fleetModelsDef: ToolDef = {
+  name: "fleet_models",
+  description: "List models available to fleet workers (falls back to a TUI hint).",
+  args: {},
+  run: (args, callCtx, rt) => fleetModelsHandler(args, callCtx, depsOf(rt)),
+};

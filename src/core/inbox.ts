@@ -16,6 +16,7 @@ import { readdir, readFile, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { INBOX_POLL_MS, hopOf, isHopExceeded, loopGuardText, messagesDir, readReq, writeRes } from "./fileTransport.js";
+import { sameDaemon } from "./v1.js";
 import type { FleetEnvelope, FleetModel } from "./fileTransport.js";
 import { writeNotify } from "./notify.js";
 import { readRegistry, registerSelf, removeSession } from "./registry.js";
@@ -33,6 +34,27 @@ export const DEFAULT_RESPONSE_POLL_MS = 500;
 
 /** Footer appended to every injected prompt so the commander can poll reliably. */
 export const DONE_FOOTER = "Reply ending with exactly: DONE:<one-line-result>";
+
+/**
+ * Normalize a `client.session.messages()` result to the message array.
+ * The v1 SDK wraps payloads as `{data, request, response}` (verified
+ * against @opencode-ai/sdk 1.18.x); raw HTTP returns the bare array.
+ * Never throws — unrecognized shapes yield [].
+ */
+// biome-ignore lint/suspicious/noExplicitAny: v1 message shapes are untyped at the boundary.
+export function messageListOf(raw: unknown): Array<{ info: any; parts: any[] }> {
+  try {
+    if (Array.isArray(raw)) return raw as Array<{ info: any; parts: any[] }>;
+    if (raw !== null && typeof raw === "object") {
+      const o = raw as { data?: unknown; messages?: unknown };
+      const inner = o.data ?? o.messages;
+      if (Array.isArray(inner)) return inner as Array<{ info: any; parts: any[] }>;
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
 
 /**
  * Daemon identity: `<hostname>-<pid>-<port>`.
@@ -231,7 +253,7 @@ export function startInboxWatcher(opts: StartInboxWatcherOpts): InboxWatcherHand
         envelope.targetDaemonId !== undefined &&
         envelope.targetDaemonId !== null &&
         envelope.targetDaemonId !== "" &&
-        envelope.targetDaemonId !== daemonId
+        !sameDaemon(envelope.targetDaemonId, daemonId)
       ) {
         continue;
       }
@@ -317,10 +339,10 @@ export function startInboxWatcher(opts: StartInboxWatcherOpts): InboxWatcherHand
       const remaining = deadline - Date.now();
       if (remaining <= 0) return null;
       try {
-        const messages = (await client.session.messages({
+        const raw = await client.session.messages({
           path: { id: sessionID },
-        })) as Array<{ info: any; parts: any[] }>;
-        const text = assistantTextOf(Array.isArray(messages) ? messages : [], beforeTime);
+        });
+        const text = assistantTextOf(messageListOf(raw), beforeTime);
         if (text !== null && doneLineOf(text) !== null) return text;
       } catch (err) {
         log(`fleet-v1 reply poll error: ${toReadableError(err)}`);

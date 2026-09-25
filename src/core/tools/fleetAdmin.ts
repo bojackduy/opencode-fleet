@@ -4,10 +4,11 @@
  *
  * Admin over the auth allowlist (commander ids) + registry summaries grouped
  * by directory/project/agent/status with counts + last DONE per group.
- * All tools are v1 tool() and never throw — failures render as readable text.
+ * All tools are runtime-agnostic ToolDefs and never throw — failures render as readable text.
  */
 
-import { tool } from "@opencode-ai/plugin";
+import { depsOf, z } from "../toolDef.js";
+import type { ToolDef } from "../toolDef.js";
 import {
   addCommander,
   getPolicy,
@@ -157,53 +158,48 @@ export async function fleetGroupHandler(args: any, _context: any, _deps?: FleetT
   }
 }
 
-export function makeFleetAllowTool(deps?: FleetToolDeps) {
-  return tool({
-    description: "Allow a commander session id into the fleet allowlist (auth accept path).",
-    args: {
-      sessionId: tool.schema.string().describe("Commander session id to allow"),
-    },
-    execute: async (args, context) => fleetAllowHandler(args, context, deps),
-  });
-}
+export const fleetAllowDef: ToolDef = {
+  name: "fleet_allow",
+  description: "Allow a commander session id into the fleet allowlist (auth accept path).",
+  args: {
+    sessionId: z.string().describe("Commander session id to allow"),
+  },
+  run: (args, callCtx, rt) => fleetAllowHandler(args, callCtx, depsOf(rt)),
+};
 
-export function makeFleetBlockTool(deps?: FleetToolDeps) {
-  return tool({
-    description: "Remove a commander session id from the fleet allowlist (deny path).",
-    args: {
-      sessionId: tool.schema.string().describe("Commander session id to block"),
-    },
-    execute: async (args, context) => fleetBlockHandler(args, context, deps),
-  });
-}
+export const fleetBlockDef: ToolDef = {
+  name: "fleet_block",
+  description: "Remove a commander session id from the fleet allowlist (deny path).",
+  args: {
+    sessionId: z.string().describe("Commander session id to block"),
+  },
+  run: (args, callCtx, rt) => fleetBlockHandler(args, callCtx, depsOf(rt)),
+};
 
-export function makeFleetPolicyTool(deps?: FleetToolDeps) {
-  return tool({
-    description:
-      "Get or set the fleet inbound policy (commander-only|accept|hold|refuse). Default is commander-only (P5 safe default).",
-    args: {
-      policy: tool.schema.string().optional().describe("commander-only|accept|hold|refuse; omit to read current"),
-    },
-    execute: async (args, context) => fleetPolicyHandler(args, context, deps),
-  });
-}
+export const fleetPolicyDef: ToolDef = {
+  name: "fleet_policy",
+  description:
+    "Get or set the fleet inbound policy (commander-only|accept|hold|refuse). Default is commander-only (P5 safe default).",
+  args: {
+    policy: z.string().optional().describe("commander-only|accept|hold|refuse; omit to read current"),
+  },
+  run: (args, callCtx, rt) => fleetPolicyHandler(args, callCtx, depsOf(rt)),
+};
 
-export function makeFleetSummaryTool(deps?: FleetToolDeps) {
-  return tool({
-    description: "Summarize fleet workers grouped by directory|project|agent|status with counts + last DONE.",
-    args: {
-      groupBy: tool.schema.string().optional().describe("directory (default)|project|agent|status"),
-    },
-    execute: async (args, context) => fleetSummaryHandler(args, context, deps),
-  });
-}
+export const fleetSummaryDef: ToolDef = {
+  name: "fleet_summary",
+  description: "Summarize fleet workers grouped by directory|project|agent|status with counts + last DONE.",
+  args: {
+    groupBy: z.string().optional().describe("directory (default)|project|agent|status"),
+  },
+  run: (args, callCtx, rt) => fleetSummaryHandler(args, callCtx, depsOf(rt)),
+};
 
-export function makeFleetGroupTool(deps?: FleetToolDeps) {
-  return tool({
-    description: "Group fleet workers like fleet_summary: counts + last DONE per group.",
-    args: {
-      groupBy: tool.schema.string().optional().describe("directory (default)|project|agent|status"),
-    },
-    execute: async (args, context) => fleetGroupHandler(args, context, deps),
-  });
-}
+export const fleetGroupDef: ToolDef = {
+  name: "fleet_group",
+  description: "Group fleet workers like fleet_summary: counts + last DONE per group.",
+  args: {
+    groupBy: z.string().optional().describe("directory (default)|project|agent|status"),
+  },
+  run: (args, callCtx, rt) => fleetGroupHandler(args, callCtx, depsOf(rt)),
+};

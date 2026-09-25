@@ -7,9 +7,12 @@
  * Never throws to the commander — failures are returned as readable text.
  */
 
-import { tool } from "@opencode-ai/plugin";
+import { depsOf, z } from "../toolDef.js";
+import type { ToolDef } from "../toolDef.js";
+import type { Runtime } from "../runtime.js";
 import { getDaemonId } from "../inbox.js";
 import { registerSelf } from "../registry.js";
+import type { FleetRuntime, RegistryEndpoint } from "../registry.js";
 import { parentIdOf } from "../heartbeat.js";
 import { resolveRole } from "../roles.js";
 
@@ -18,6 +21,7 @@ export interface FleetToolDeps {
   // biome-ignore lint/suspicious/noExplicitAny: v1 plugin client is untyped at the boundary.
   client?: any;
   serverUrl?: string | URL;
+  rt?: Runtime;
 }
 
 function selfIdOf(context: any): string {
@@ -49,8 +53,19 @@ export async function fleetRegisterHandler(
     const summary = raw !== "" ? raw : "worker";
     const sessionId = selfIdOf(context);
     if (!sessionId) return "fleet_register failed: could not determine current session id";
-    const daemonId = getDaemonId(serverUrlOf(context, deps));
-    const directory = context?.directory ?? context?.worktree ?? process.cwd();
+    // Part 2: the runtime owns the daemon identity. v2 uses `v2:<service-url>`;
+    // v1 keeps getDaemonId(serverUrl) (registerSelf adds the `:v1` marker).
+    const rt = deps?.rt;
+    const runtime: FleetRuntime = rt?.kind === "v2" ? "v2" : "v1";
+    const daemonId = runtime === "v2" && rt ? rt.daemonId : getDaemonId(serverUrlOf(context, deps));
+    const ep = runtime === "v2" && rt ? rt.selfEndpoint() : null;
+    const endpoint: RegistryEndpoint | undefined =
+      ep === null
+        ? undefined
+        : { kind: ep.kind === "v2-service" ? "v2-service" : "v2-standalone", url: ep.url };
+    const directory = String(
+      context?.directory ?? context?.worktree ?? ep?.location ?? process.cwd(),
+    );
     // P5: parentID from explicit arg, else best-effort session.get (API only).
     let parentID = typeof args?.parentID === "string" ? args.parentID.trim() : "";
     if (parentID === "") {
@@ -78,6 +93,9 @@ export async function fleetRegisterHandler(
       summary,
       title: summary,
       role,
+      runtime,
+      ...(endpoint ? { endpoint } : {}),
+      ...(runtime === "v2" && ep?.location ? { location: ep.location } : {}),
       ...(parentID !== "" ? { parentID } : {}),
     });
     try {
@@ -93,17 +111,16 @@ export async function fleetRegisterHandler(
   }
 }
 
-export function makeFleetRegisterTool(deps?: FleetToolDeps) {
-  return tool({
-    description:
-      "Register the current session as a fleet worker so the commander can list it and delegate tasks to it.",
-    args: {
-      summary: tool.schema.string().describe("Short human-readable label for this worker session"),
-      parentID: tool.schema
-        .string()
-        .optional()
-        .describe("Parent session id for forks (sets worker role; auto-detected via session.get when omitted)"),
-    },
-    execute: async (args, context) => fleetRegisterHandler(args, context, deps),
-  });
-}
+export const fleetRegisterDef: ToolDef = {
+  name: "fleet_register",
+  description:
+    "Register the current session as a fleet worker so the commander can list it and delegate tasks to it.",
+  args: {
+    summary: z.string().describe("Short human-readable label for this worker session"),
+    parentID: z
+      .string()
+      .optional()
+      .describe("Parent session id for forks (sets worker role; auto-detected via session.get when omitted)"),
+  },
+  run: (args, callCtx, rt) => fleetRegisterHandler(args, callCtx, depsOf(rt)),
+};

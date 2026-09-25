@@ -32,7 +32,7 @@
 
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { stateDir } from "./registry.js";
+import { stateDir, withStateLock } from "./registry.js";
 import type { RegistryEntry } from "./registry.js";
 
 export type FleetPolicy = "commander-only" | "accept" | "hold" | "refuse";
@@ -211,12 +211,14 @@ export async function addCommander(commanderId: string): Promise<string[]> {
   try {
     const id = String(commanderId ?? "").trim();
     if (id === "") return (await readAuth()).commanders;
-    const state = await readAuth();
-    if (!state.commanders.includes(id)) {
-      state.commanders.push(id);
-      await writeAuthAtomic(state);
-    }
-    return state.commanders;
+    return await withStateLock(async () => {
+      const state = await readAuth();
+      if (!state.commanders.includes(id)) {
+        state.commanders.push(id);
+        await writeAuthAtomic(state);
+      }
+      return state.commanders;
+    });
   } catch {
     try {
       return (await readAuth()).commanders;
@@ -230,12 +232,14 @@ export async function addCommander(commanderId: string): Promise<string[]> {
 export async function removeCommander(commanderId: string): Promise<string[]> {
   try {
     const id = String(commanderId ?? "").trim();
-    const state = await readAuth();
-    const next = state.commanders.filter((c) => c !== id);
-    if (next.length !== state.commanders.length) {
-      await writeAuthAtomic({ commanders: next, policy: state.policy });
-    }
-    return next;
+    return await withStateLock(async () => {
+      const state = await readAuth();
+      const next = state.commanders.filter((c) => c !== id);
+      if (next.length !== state.commanders.length) {
+        await writeAuthAtomic({ commanders: next, policy: state.policy });
+      }
+      return next;
+    });
   } catch {
     try {
       return (await readAuth()).commanders;
@@ -266,9 +270,12 @@ export async function setPolicy(policy: string): Promise<FleetPolicy> {
     ) {
       return (await readAuth()).policy;
     }
-    const state = await readAuth();
-    state.policy = p;
-    await writeAuthAtomic(state);
+    await withStateLock(async () => {
+      // Re-read under lock so a concurrent allowlist change is not clobbered.
+      const fresh = await readAuth();
+      fresh.policy = p;
+      await writeAuthAtomic(fresh);
+    });
     return p;
   } catch {
     try {
