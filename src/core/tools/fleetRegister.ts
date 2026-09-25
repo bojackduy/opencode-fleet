@@ -2,7 +2,7 @@
  * fleetRegister.ts — Phase 3 `fleet_register` tool.
  *
  * Registers the calling session as a fleet worker in
- * `fleet-v1/registry.json` via `registerSelf()`.
+ * `fleet/registry.json` via `registerSelf()`.
  *
  * Never throws to the commander — failures are returned as readable text.
  */
@@ -100,7 +100,7 @@ export async function fleetRegisterHandler(
     });
     try {
       await deps?.client?.app?.log?.({
-        body: { service: "fleet-v1", level: "info", message: `registered ${sessionId} as ${summary} role=${role}` },
+        body: { service: "fleet", level: "info", message: `registered ${sessionId} as ${summary} role=${role}` },
       });
     } catch {
       // Logging is best-effort.

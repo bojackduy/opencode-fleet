@@ -1,9 +1,9 @@
 /**
- * auth.ts — P4 inbound policy + commander allowlist for fleet-v1.
+ * auth.ts — P4 inbound policy + commander allowlist for fleet.
  *
  * State file (0600, atomic temp+rename):
- *   $XDG_STATE_HOME/opencode/fleet-v1/auth.json
- *   (fallback ~/.local/state/opencode/fleet-v1/auth.json)
+ *   $XDG_STATE_HOME/opencode/fleet/auth.json
+ *   (fallback ~/.local/state/opencode/fleet/auth.json)
  * Shape: { commanders: string[], policy: "commander-only" | "accept" | "hold" | "refuse" }
  * Default policy is "commander-only" (P5 safe default: closed mesh).
  *
@@ -32,7 +32,7 @@
 
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { stateDir, withStateLock } from "./registry.js";
+import { stateDir, withStateLock, ensureStateMigrated } from "./registry.js";
 import type { RegistryEntry } from "./registry.js";
 
 export type FleetPolicy = "commander-only" | "accept" | "hold" | "refuse";
@@ -71,6 +71,7 @@ function defaults(): AuthState {
 /** Read auth state. Never throws — missing/corrupt yields defaults. */
 export async function readAuth(): Promise<AuthState> {
   try {
+    await ensureStateMigrated();
     const raw = await readFile(authPath(), "utf8");
     const parsed = JSON.parse(raw) as Partial<AuthState>;
     if (typeof parsed !== "object" || parsed === null) return defaults();

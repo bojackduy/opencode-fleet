@@ -1,7 +1,7 @@
 /**
- * inbox.ts — Phase 2 inbox watcher for fleet-v1.
+ * inbox.ts — Phase 2 inbox watcher for fleet.
  *
- * Worker-side loop: polls `fleet-v1/messages/*.req.json` for requests
+ * Worker-side loop: polls `fleet/messages/*.req.json` for requests
  * targeting this session (and this daemon), replays each one as a normal
  * user message via `client.session.promptAsync` (NEVER noReply/silent),
  * then polls `client.session.messages` for the assistant reply and writes
@@ -19,7 +19,7 @@ import { INBOX_POLL_MS, hopOf, isHopExceeded, loopGuardText, messagesDir, readRe
 import { sameDaemon } from "./v1.js";
 import type { FleetEnvelope, FleetModel } from "./fileTransport.js";
 import { writeNotify } from "./notify.js";
-import { readRegistry, registerSelf, removeSession } from "./registry.js";
+import { readRegistry, registerSelf, removeSession, ensureStateMigrated } from "./registry.js";
 
 export { INBOX_POLL_MS };
 
@@ -92,7 +92,7 @@ export function claimedPath(reqId: string): string {
  */
 export function buildInjectText(envelope: FleetEnvelope): string {
   const hop = hopOf(envelope);
-  const header = `[from fleet-v1 ${envelope.reqId} | commander:${envelope.fromCommander} | hop:${hop}]`;
+  const header = `[from fleet ${envelope.reqId} | commander:${envelope.fromCommander} | hop:${hop}]`;
   const body = (envelope.message ?? "").trim();
   if (/DONE:/.test(body)) return `${header}\n${body}\n${DONE_FOOTER}`;
   return `${header}\n${body}\n${DONE_FOOTER}`;
@@ -208,7 +208,7 @@ export function startInboxWatcher(opts: StartInboxWatcherOpts): InboxWatcherHand
     }
     try {
       void client?.app?.log?.({
-        body: { service: "fleet-v1", level: "info", message: m },
+        body: { service: "fleet", level: "info", message: m },
       });
     } catch {
       // client.app.log is best-effort.
@@ -217,7 +217,7 @@ export function startInboxWatcher(opts: StartInboxWatcherOpts): InboxWatcherHand
 
   const timer: ReturnType<typeof setInterval> = setInterval(() => {
     if (!running) return;
-    void scan().catch((err: unknown) => log(`fleet-v1 inbox scan error: ${toReadableError(err)}`));
+    void scan().catch((err: unknown) => log(`fleet inbox scan error: ${toReadableError(err)}`));
   }, pollMs);
   // Don't keep the daemon alive just for the watcher.
   if (typeof (timer as unknown as { unref?: () => void }).unref === "function") {
@@ -225,6 +225,7 @@ export function startInboxWatcher(opts: StartInboxWatcherOpts): InboxWatcherHand
   }
 
   async function scan(): Promise<void> {
+    await ensureStateMigrated();
     let files: string[];
     try {
       files = await readdir(messagesDir());
@@ -275,7 +276,7 @@ export function startInboxWatcher(opts: StartInboxWatcherOpts): InboxWatcherHand
         } catch {
           // writeRes failing must not crash the watcher.
         }
-        log(`fleet-v1 req ${reqId}: ${text}`);
+        log(`fleet req ${reqId}: ${text}`);
         return;
       }
       await writeFile(claimedPath(reqId), daemonId, { mode: 0o600 }).catch(() => undefined);
@@ -297,7 +298,7 @@ export function startInboxWatcher(opts: StartInboxWatcherOpts): InboxWatcherHand
           ok: false,
           error: `timeout waiting for DONE: reply after ${INBOX_RESPONSE_TIMEOUT_MS}ms (req ${reqId})`,
         });
-        log(`fleet-v1 req ${reqId}: reply timeout`);
+        log(`fleet req ${reqId}: reply timeout`);
         return;
       }
       const done = doneLineOf(reply);
@@ -306,7 +307,7 @@ export function startInboxWatcher(opts: StartInboxWatcherOpts): InboxWatcherHand
           ok: false,
           error: `empty reply: no trailing DONE: line found (req ${reqId})`,
         });
-        log(`fleet-v1 req ${reqId}: no DONE: line`);
+        log(`fleet req ${reqId}: no DONE: line`);
         return;
       }
       await writeRes(reqId, { ok: true, reply: reply.trim() });
@@ -315,13 +316,13 @@ export function startInboxWatcher(opts: StartInboxWatcherOpts): InboxWatcherHand
       } catch (err) {
         try {
           void client?.app?.log?.({
-            body: { service: "fleet-v1", level: "warn", message: `fleet-v1 req ${reqId}: notify write failed: ${toReadableError(err)}` },
+            body: { service: "fleet", level: "warn", message: `fleet req ${reqId}: notify write failed: ${toReadableError(err)}` },
           });
         } catch {
           // client.app.log is best-effort.
         }
       }
-      log(`fleet-v1 req ${reqId}: DONE:${done}`);
+      log(`fleet req ${reqId}: DONE:${done}`);
     } catch (err) {
       const text = toReadableError(err);
       try {
@@ -329,7 +330,7 @@ export function startInboxWatcher(opts: StartInboxWatcherOpts): InboxWatcherHand
       } catch {
         // writeRes failing must not crash the watcher.
       }
-      log(`fleet-v1 req ${reqId} error: ${text}`);
+      log(`fleet req ${reqId} error: ${text}`);
     }
   }
 
@@ -345,7 +346,7 @@ export function startInboxWatcher(opts: StartInboxWatcherOpts): InboxWatcherHand
         const text = assistantTextOf(messageListOf(raw), beforeTime);
         if (text !== null && doneLineOf(text) !== null) return text;
       } catch (err) {
-        log(`fleet-v1 reply poll error: ${toReadableError(err)}`);
+        log(`fleet reply poll error: ${toReadableError(err)}`);
       }
       await new Promise((r) => setTimeout(r, Math.min(responsePollMs, Math.max(0, remaining))));
       if (Date.now() >= deadline) return null;

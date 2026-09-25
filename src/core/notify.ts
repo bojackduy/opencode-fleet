@@ -1,5 +1,5 @@
 /**
- * notify.ts — P3 DONE notifications for fleet-v1.
+ * notify.ts — P3 DONE notifications for fleet.
  *
  * After the inbox watcher writes `<reqId>.res.json` with ok:true (DONE line
  * found), it also writes `<reqId>.notify.json` so the commander side can

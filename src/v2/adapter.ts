@@ -27,7 +27,7 @@
 
 import { appendFile, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { registerSelf, removeSessionScoped, stateDir } from "../core/registry.js";
+import { registerSelf, removeSessionScoped, stateDir, ensureStateMigrated } from "../core/registry.js";
 import type { RegistryEndpoint } from "../core/registry.js";
 import { ALL_TOOL_DEFS } from "../core/tools/index.js";
 import { z } from "../core/toolDef.js";
@@ -381,7 +381,7 @@ async function runEventLoop(
 ): Promise<void> {
   const subscribe = ctx.event?.subscribe;
   if (typeof subscribe !== "function") {
-    rt.log("warn", "fleet.v1 v2 setup: ctx.event.subscribe unavailable; heartbeat events disabled");
+    rt.log("warn", "fleet v2 setup: ctx.event.subscribe unavailable; heartbeat events disabled");
     return;
   }
   try {
@@ -409,11 +409,11 @@ async function runEventLoop(
           }
         }
       } catch (err) {
-        rt.log("warn", `fleet.v1 v2 event error: ${toReadableError(err)}`);
+        rt.log("warn", `fleet v2 event error: ${toReadableError(err)}`);
       }
     }
   } catch (err) {
-    if (!signal.aborted) rt.log("warn", `fleet.v1 v2 event loop ended: ${toReadableError(err)}`);
+    if (!signal.aborted) rt.log("warn", `fleet v2 event loop ended: ${toReadableError(err)}`);
   }
 }
 
@@ -435,7 +435,7 @@ function startV2SpoolWatcher(log: Runtime["log"]): { stop: () => void } {
 
   const timer: ReturnType<typeof setInterval> = setInterval(() => {
     if (!running) return;
-    void scan().catch((err: unknown) => log("warn", `fleet.v1 v2 spool scan error: ${toReadableError(err)}`));
+    void scan().catch((err: unknown) => log("warn", `fleet v2 spool scan error: ${toReadableError(err)}`));
   }, INBOX_POLL_MS);
   if (typeof (timer as unknown as { unref?: () => void }).unref === "function") {
     (timer as unknown as { unref: () => void }).unref();
@@ -463,6 +463,7 @@ function startV2SpoolWatcher(log: Runtime["log"]): { stop: () => void } {
   }
 
   async function scan(): Promise<void> {
+    await ensureStateMigrated();
     const s = daemonState();
     if (s.daemonId === "") return;
     if (hostingApis().length === 0) return; // spool-only degrade: claim nothing we can't serve
@@ -517,7 +518,7 @@ function startV2SpoolWatcher(log: Runtime["log"]): { stop: () => void } {
         } catch {
           // never crash the watcher
         }
-        log("warn", `fleet.v1 v2 req ${reqId}: ${text}`);
+        log("warn", `fleet v2 req ${reqId}: ${text}`);
         return;
       }
       await writeFile(claimedPath(reqId), s.daemonId, { mode: 0o600 }).catch(() => undefined);
@@ -538,14 +539,14 @@ function startV2SpoolWatcher(log: Runtime["log"]): { stop: () => void } {
           ok: true,
           reply: `injected via v2 spool; DONE poll unavailable (req ${reqId})`,
         }).catch(() => undefined);
-        log("info", `fleet.v1 v2 req ${reqId}: injected (DONE poll unavailable)`);
+        log("info", `fleet v2 req ${reqId}: injected (DONE poll unavailable)`);
         return;
       }
       const reply = await pollV2Done(s.serviceUrl, pw, targetSessionId, since, INBOX_RESPONSE_TIMEOUT_MS);
       if (reply === null) {
         const errText = `timeout waiting for DONE: reply after ${INBOX_RESPONSE_TIMEOUT_MS}ms (req ${reqId})`;
         await writeRes(reqId, { ok: false, error: errText }).catch(() => undefined);
-        log("warn", `fleet.v1 v2 req ${reqId}: ${errText}`);
+        log("warn", `fleet v2 req ${reqId}: ${errText}`);
         return;
       }
       await writeRes(reqId, { ok: true, reply: reply.trim() }).catch(() => undefined);
@@ -555,7 +556,7 @@ function startV2SpoolWatcher(log: Runtime["log"]): { stop: () => void } {
       } catch {
         // notify is best-effort
       }
-      log("info", `fleet.v1 v2 req ${reqId}: DONE reply captured`);
+      log("info", `fleet v2 req ${reqId}: DONE reply captured`);
     } catch (err) {
       const text = toReadableError(err);
       try {
@@ -563,7 +564,7 @@ function startV2SpoolWatcher(log: Runtime["log"]): { stop: () => void } {
       } catch {
         // never crash the watcher
       }
-      log("warn", `fleet.v1 v2 req ${reqId} error: ${text}`);
+      log("warn", `fleet v2 req ${reqId} error: ${text}`);
     }
   }
 
@@ -590,7 +591,7 @@ export async function v2Setup(ctx: V2Context): Promise<(() => void) | void> {
     typeof ctx?.session?.prompt === "function" || typeof ctx?.session?.get === "function";
   const hasEventApi = typeof ctx?.event?.subscribe === "function";
   if (!hasToolApi && !hasSessionApi && !hasEventApi) {
-    log("warn", "fleet.v1 v2 setup: no v2 plugin APIs detected (foreign host); skipping v2 setup entirely");
+    log("warn", "fleet v2 setup: no v2 plugin APIs detected (foreign host); skipping v2 setup entirely");
     return;
   }
 
@@ -611,18 +612,18 @@ export async function v2Setup(ctx: V2Context): Promise<(() => void) | void> {
   try {
     const toolApi = ctx?.tool;
     if (typeof toolApi?.transform !== "function") {
-      log("warn", "fleet.v1 v2 setup: ctx.tool.transform unavailable; no tools registered (spool-only)");
+      log("warn", "fleet v2 setup: ctx.tool.transform unavailable; no tools registered (spool-only)");
     } else {
       const specs = ALL_TOOL_DEFS.map((d) => toV2Tool(d, rt));
       await toolApi.transform((t) => {
         for (const s of specs) t.add(s);
       });
-      log("info", `fleet.v1 v2 setup: registered ${specs.length} tools`, {
+      log("info", `fleet v2 setup: registered ${specs.length} tools`, {
         app: ctx.app?.version ?? "",
       });
     }
   } catch (err) {
-    log("error", `fleet.v1 v2 tool setup failed: ${toReadableError(err)}`);
+    log("error", `fleet v2 tool setup failed: ${toReadableError(err)}`);
   }
 
   // Process-wide singleton: per-location ref-counting.
@@ -638,11 +639,11 @@ export async function v2Setup(ctx: V2Context): Promise<(() => void) | void> {
       getRaw: ctx.session.get.bind(ctx.session),
     });
   } else {
-    log("warn", "fleet.v1 v2 setup: ctx.session.prompt/get unavailable; this location cannot serve spool (spool-only degrade)");
+    log("warn", "fleet v2 setup: ctx.session.prompt/get unavailable; this location cannot serve spool (spool-only degrade)");
   }
   if (!s.watcher) {
     s.watcher = startV2SpoolWatcher(log);
-    log("info", "fleet.v1 v2 spool watcher started (process-wide)");
+    log("info", "fleet v2 spool watcher started (process-wide)");
   }
 
   // Event-driven heartbeat for this location.
@@ -650,7 +651,7 @@ export async function v2Setup(ctx: V2Context): Promise<(() => void) | void> {
   const api = s.apis.get(location);
   void runEventLoop(ctx, rt, api, location, aborter.signal);
 
-  log("info", `fleet.v1 v2 setup: location ready daemon=${daemonId}`, { location });
+  log("info", `fleet v2 setup: location ready daemon=${daemonId}`, { location });
 
   // Cleanup on location unload: release this location; stop the watcher when
   // the last location goes away.

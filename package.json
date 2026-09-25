@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
-  "name": "@bojackduy/opencode-fleet-v1",
-  "version": "0.1.1",
-  "description": "Lightweight orchestrator → workers for OpenCode v1 (file spool + prompt_async, takeover-friendly).",
+  "name": "@bojackduy/opencode-fleet",
+  "version": "0.2.0",
+  "description": "Lightweight orchestrator → workers for OpenCode (file spool + prompt_async, takeover-friendly; v1+v2 compatible).",
   "type": "module",
   "main": "dist/index.js",
   "exports": {
@@ -14,11 +14,11 @@
   "author": "bojackduy",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/bojackduy/opencode-fleet-v1.git"
+    "url": "git+https://github.com/bojackduy/opencode-fleet.git"
   },
-  "homepage": "https://github.com/bojackduy/opencode-fleet-v1#readme",
+  "homepage": "https://github.com/bojackduy/opencode-fleet#readme",
   "bugs": {
-    "url": "https://github.com/bojackduy/opencode-fleet-v1/issues"
+    "url": "https://github.com/bojackduy/opencode-fleet/issues"
   },
   "keywords": [
     "opencode",

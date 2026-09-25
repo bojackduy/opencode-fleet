@@ -228,7 +228,7 @@ async function discoverParentIdViaApi(client: unknown, sessionId: string): Promi
 async function appLog(client: unknown, message: string): Promise<void> {
   try {
     const c = client as { app?: { log?: (args: unknown) => Promise<unknown> } } | null;
-    await c?.app?.log?.({ body: { service: "fleet-v1", level: "info", message } });
+    await c?.app?.log?.({ body: { service: "fleet", level: "info", message } });
   } catch {
     // best-effort only
   }
@@ -288,7 +288,7 @@ export async function beat(input: BeatInput): Promise<Heartbeat> {
         parentID = parentIdOf(s);
       }
     } catch (err) {
-      await appLog(client, `fleet-v1 heartbeat: session.get failed for ${sessionId}: ${toReadableError(err)}`);
+      await appLog(client, `fleet heartbeat: session.get failed for ${sessionId}: ${toReadableError(err)}`);
     }
     // P5 fallback: discover the parent via the v1 API list (never sqlite).
     if (parentID === "") {
@@ -304,7 +304,7 @@ export async function beat(input: BeatInput): Promise<Heartbeat> {
       const rawStatus = await client.session.status();
       status = statusTextOf(unwrap<unknown>(rawStatus), sessionId);
     } catch (err) {
-      await appLog(client, `fleet-v1 heartbeat: session.status failed for ${sessionId}: ${toReadableError(err)}`);
+      await appLog(client, `fleet heartbeat: session.status failed for ${sessionId}: ${toReadableError(err)}`);
     }
 
     let lastDone = "";
@@ -324,7 +324,7 @@ export async function beat(input: BeatInput): Promise<Heartbeat> {
       agent = um.agent;
       model = um.model;
     } catch (err) {
-      await appLog(client, `fleet-v1 heartbeat: session.messages failed for ${sessionId}: ${toReadableError(err)}`);
+      await appLog(client, `fleet heartbeat: session.messages failed for ${sessionId}: ${toReadableError(err)}`);
     }
 
     let role: Role = "peer";
@@ -349,7 +349,7 @@ export async function beat(input: BeatInput): Promise<Heartbeat> {
     };
   } catch (err) {
     try {
-      await appLog(input?.client, `fleet-v1 heartbeat failed for ${sessionId}: ${toReadableError(err)}`);
+      await appLog(input?.client, `fleet heartbeat failed for ${sessionId}: ${toReadableError(err)}`);
     } catch {
       // ignore
     }

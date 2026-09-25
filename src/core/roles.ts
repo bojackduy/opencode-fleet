@@ -1,5 +1,5 @@
 /**
- * roles.ts — P5 role + hierarchy for fleet-v1.
+ * roles.ts — P5 role + hierarchy for fleet.
  *
  * Roles: "commander" | "worker" | "peer".
  *   - A session WITH a parentID (fork) is ALWAYS a "worker".

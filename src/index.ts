@@ -13,4 +13,4 @@ import { v2Setup } from "./v2/adapter.js";
 export { server } from "./v1/adapter.js";
 export { v2Setup } from "./v2/adapter.js";
 
-export default { id: "fleet.v1", server, setup: v2Setup };
+export default { id: "fleet", server, setup: v2Setup };

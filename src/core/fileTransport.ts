@@ -1,10 +1,10 @@
 /**
- * fileTransport.ts — file-spool transport for fleet-v1.
+ * fileTransport.ts — file-spool transport for fleet.
  *
  * Layout under the v1-namespaced state dir:
- *   $XDG_STATE_HOME/opencode/fleet-v1/messages/<reqId>.req.json
- *   $XDG_STATE_HOME/opencode/fleet-v1/messages/<reqId>.res.json
- *   (fallback ~/.local/state/opencode/fleet-v1/ when XDG_STATE_HOME is unset)
+ *   $XDG_STATE_HOME/opencode/fleet/messages/<reqId>.req.json
+ *   $XDG_STATE_HOME/opencode/fleet/messages/<reqId>.res.json
+ *   (fallback ~/.local/state/opencode/fleet/ when XDG_STATE_HOME is unset)
  *
  * Envelope carries everything Phase 2 needs to replay a delegation as a
  * normal user message via prompt_async: agent / model / variant / system.
@@ -15,6 +15,7 @@
 import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { ensureStateMigrated } from "./registry.js";
 
 /** Model reference: structured form or "provider/model" shorthand. */
 export interface FleetModel {
@@ -112,8 +113,8 @@ export function chainRefsOf(message: string): string[] {
 
 export function stateDir(): string {
   const xdg = process.env.XDG_STATE_HOME;
-  if (xdg && xdg.trim() !== "") return join(xdg, "opencode", "fleet-v1");
-  return join(homedir(), ".local", "state", "opencode", "fleet-v1");
+  if (xdg && xdg.trim() !== "") return join(xdg, "opencode", "fleet");
+  return join(homedir(), ".local", "state", "opencode", "fleet");
 }
 
 export function messagesDir(): string {
@@ -129,6 +130,7 @@ export function resPath(reqId: string): string {
 }
 
 export async function atomicWriteJson(filePath: string, data: unknown): Promise<void> {
+  await ensureStateMigrated();
   await mkdir(messagesDir(), { recursive: true });
   const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   await writeFile(tmp, JSON.stringify(data, null, 2) + "\n", { mode: 0o600 });
@@ -181,6 +183,7 @@ export interface ReadResOptions {
  * Returns null on timeout. Throws AbortError when signal aborts.
  */
 export async function readRes(reqId: string, timeoutMs: number, signal?: AbortSignal): Promise<FleetResult | null> {
+  await ensureStateMigrated();
   const path = resPath(reqId);
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -201,6 +204,7 @@ export async function readRes(reqId: string, timeoutMs: number, signal?: AbortSi
 /** Read a request envelope once; null when absent/unreadable. */
 export async function readReq(reqId: string): Promise<FleetEnvelope | null> {
   try {
+    await ensureStateMigrated();
     const raw = await readFile(reqPath(reqId), "utf8");
     return JSON.parse(raw) as FleetEnvelope;
   } catch {

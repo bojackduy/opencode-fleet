@@ -134,7 +134,7 @@ export async function fleetClaimCommanderHandler(
     const role = await claimCommander(id);
     try {
       await deps?.client?.app?.log?.({
-        body: { service: "fleet-v1", level: "info", message: `claimed commander ${id}` },
+        body: { service: "fleet", level: "info", message: `claimed commander ${id}` },
       });
     } catch {
       // best-effort
@@ -158,7 +158,7 @@ export async function fleetReleaseCommanderHandler(
     const role = await releaseCommander(id);
     try {
       await deps?.client?.app?.log?.({
-        body: { service: "fleet-v1", level: "info", message: `released commander ${id}` },
+        body: { service: "fleet", level: "info", message: `released commander ${id}` },
       });
     } catch {
       // best-effort

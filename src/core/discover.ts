@@ -1,5 +1,5 @@
 /**
- * discover.ts — v1-only read-only discovery for fleet-v1 (P4 API-first).
+ * discover.ts — v1-only read-only discovery for fleet (P4 API-first).
  *
  * PRIMARY path (hot): heartbeat registry written by beat() via the v1 API
  * (`client.session.get/status/messages`), plus live `discoverViaClient()`
@@ -66,7 +66,7 @@ export async function logDeprecated(client: unknown, message: string): Promise<v
       app?: { log?: (args: unknown) => Promise<unknown> };
     } | null;
     await c?.app?.log?.({
-      body: { service: "fleet-v1", level: "warn", message: `fleet-v1 deprecated discover path: ${message}` },
+      body: { service: "fleet", level: "warn", message: `fleet deprecated discover path: ${message}` },
     });
   } catch {
     // best-effort only

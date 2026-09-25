@@ -221,7 +221,7 @@ export async function fleetHandoffBackHandler(
         await client.session.promptAsync({ path: { id: commanderId }, body });
         try {
           await client?.app?.log?.({
-            body: { service: "fleet-v1", level: "info", message: `fleet-v1 handoff ${reqId} Re:${inbound.reqId} direct → ${commanderId}` },
+            body: { service: "fleet", level: "info", message: `fleet handoff ${reqId} Re:${inbound.reqId} direct → ${commanderId}` },
           });
         } catch {
           // best-effort
@@ -235,7 +235,7 @@ export async function fleetHandoffBackHandler(
           // unreachable; keep the same rule here.
           try {
             await client?.app?.log?.({
-              body: { service: "fleet-v1", level: "warn", message: `fleet-v1 handoff ${reqId} direct failed, spooling: ${toReadableError(err)}` },
+              body: { service: "fleet", level: "warn", message: `fleet handoff ${reqId} direct failed, spooling: ${toReadableError(err)}` },
             });
           } catch {
             // best-effort

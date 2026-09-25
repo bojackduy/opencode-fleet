@@ -1,9 +1,9 @@
 /**
- * registry.ts — fleet-v1 session registry.
+ * registry.ts — fleet session registry.
  *
  * State path (v1-only namespace):
- *   $XDG_STATE_HOME/opencode/fleet-v1/registry.json
- *   fallback ~/.local/state/opencode/fleet-v1/registry.json
+ *   $XDG_STATE_HOME/opencode/fleet/registry.json
+ *   fallback ~/.local/state/opencode/fleet/registry.json
  *
  * Concurrency: in-process read-modify-write is serialized with a promise
  * chain; CROSS-PROCESS RMW (v1 daemon + v2 service share this file, and
@@ -14,7 +14,7 @@
  * Never throws on missing/corrupt registry — returns [] instead.
  */
 
-import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { withV1Marker } from "./v1.js";
@@ -94,8 +94,73 @@ export function fleetKeyOf(e: Pick<RegistryEntry, "runtime" | "daemonId" | "sess
 
 export function stateDir(): string {
   const xdg = process.env.XDG_STATE_HOME;
-  if (xdg && xdg.trim() !== "") return join(xdg, "opencode", "fleet-v1");
-  return join(homedir(), ".local", "state", "opencode", "fleet-v1");
+  if (xdg && xdg.trim() !== "") return join(xdg, "opencode", "fleet");
+  return join(homedir(), ".local", "state", "opencode", "fleet");
+}
+
+const LEGACY_SEGMENT = "fleet-v1"; // legacy fleet-v1/messages compat fallback
+
+/** Pre-rename (0.1.x) state dir. Used read-only by the one-time migration below. */
+export function legacyStateDir(): string {
+  const xdg = process.env.XDG_STATE_HOME;
+  if (xdg && xdg.trim() !== "") return join(xdg, "opencode", LEGACY_SEGMENT);
+  return join(homedir(), ".local", "state", "opencode", LEGACY_SEGMENT);
+}
+
+async function pathExists(p: string): Promise<boolean> {
+  try {
+    await stat(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * One-time migration from the pre-rename state dir to the new one.
+ * Copies missing files over (whole tree when the new dir is absent,
+ * per-file for registry.json / auth.json / messages otherwise) so live
+ * fleets survive the upgrade. Best-effort — never throws. Cached: the
+ * copy is attempted at most once per process.
+ */
+async function migrateLegacyStateOnce(): Promise<void> {
+  try {
+    const next = stateDir();
+    const prev = legacyStateDir();
+    if (next === prev) return;
+    if (!(await pathExists(prev))) return;
+    if (!(await pathExists(next))) {
+      await mkdir(dirname(next), { recursive: true });
+      await cp(prev, next, { recursive: true });
+      await chmod(join(next, "registry.json"), 0o600).catch(() => undefined);
+      await chmod(join(next, "auth.json"), 0o600).catch(() => undefined);
+      return;
+    }
+    for (const name of ["registry.json", "auth.json", "messages"]) {
+      try {
+        const dst = join(next, name);
+        const src = join(prev, name);
+        if ((await pathExists(dst)) || !(await pathExists(src))) continue;
+        await cp(src, dst, { recursive: true });
+      } catch {
+        // per-file best-effort; keep migrating the rest.
+      }
+    }
+  } catch {
+    // best-effort only — migration must never break reads.
+  }
+}
+
+let migrated: Promise<void> | null = null;
+
+/** Ensure the one-time legacy migration ran (cached). Never throws. */
+export function ensureStateMigrated(): Promise<void> {
+  try {
+    if (!migrated) migrated = migrateLegacyStateOnce();
+    return migrated;
+  } catch {
+    return Promise.resolve();
+  }
 }
 
 export function registryPath(): string {
@@ -176,6 +241,7 @@ async function atomicWriteJson(filePath: string, data: unknown): Promise<void> {
  */
 export async function readRegistry(): Promise<RegistryEntry[]> {
   try {
+    await ensureStateMigrated();
     const raw = await readFile(registryPath(), "utf8");
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];

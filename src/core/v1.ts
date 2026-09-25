@@ -1,5 +1,5 @@
 /**
- * v1.ts — v1-only enforcement for fleet-v1.
+ * v1.ts — v1-only enforcement for fleet.
  *
  * Pinned binary + version, plus helpers to detect (and skip) v2 daemons:
  *  - v2 `.bun serve --service` on port 49374

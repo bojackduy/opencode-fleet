@@ -1,12 +1,12 @@
 /**
- * v1/adapter.ts — OpenCode v1 (1.18.x) adapter: the original fleet-v1
+ * v1/adapter.ts — OpenCode v1 (1.18.x) adapter: the original fleet
  * server() wiring, rebuilt on the runtime-agnostic core (src/core/).
  * Behaviour is identical to the pre-core index.ts; tools are the core
  * ToolDefs wrapped with v1 `tool()`.
  *
  * server() runs once per daemon process (NOT per session), so there is no
  * "current sessionID" here. The inbox watcher is therefore daemon-wide:
- * it scans fleet-v1/messages/*.req.json for envelopes whose targetDaemonId
+ * it scans fleet/messages/*.req.json for envelopes whose targetDaemonId
  * matches this daemon's getDaemonId(serverUrl) and replays each one into
  * envelope.targetSessionId via client.session.promptAsync — as a normal
  * user bubble (never noReply/silent) so manual takeover with
@@ -34,7 +34,7 @@ import {
   readReq,
   writeRes,
 } from "../core/fileTransport.js";
-import { readRegistry, registerSelf, removeSession } from "../core/registry.js";
+import { readRegistry, registerSelf, removeSession, ensureStateMigrated } from "../core/registry.js";
 import { beat } from "../core/heartbeat.js";
 import { writeNotify } from "../core/notify.js";
 import { ALL_TOOL_DEFS } from "../core/tools/index.js";
@@ -121,7 +121,7 @@ function startDaemonWatcher(
       void (client as unknown as {
         app?: { log?: (args: unknown) => Promise<unknown> };
       })?.app?.log?.({
-        body: { service: "fleet-v1", level: "info", message: m },
+        body: { service: "fleet", level: "info", message: m },
       });
     } catch {
       // best-effort only; never use console.log in plugins.
@@ -131,7 +131,7 @@ function startDaemonWatcher(
   const timer: ReturnType<typeof setInterval> = setInterval(() => {
     if (!running) return;
     void scan().catch((err: unknown) =>
-      log(`fleet-v1 inbox scan error: ${toReadableError(err)}`),
+      log(`fleet inbox scan error: ${toReadableError(err)}`),
     );
   }, pollMs);
   if (typeof (timer as unknown as { unref?: () => void }).unref === "function") {
@@ -139,6 +139,7 @@ function startDaemonWatcher(
   }
 
   async function scan(): Promise<void> {
+    await ensureStateMigrated();
     let files: string[];
     try {
       files = await readdir(messagesDir());
@@ -186,7 +187,7 @@ function startDaemonWatcher(
         } catch {
           // writeRes failing must not crash the watcher.
         }
-        log(`fleet-v1 req ${reqId}: ${text}`);
+        log(`fleet req ${reqId}: ${text}`);
         return;
       }
       await writeFile(claimedPath(reqId), daemonId, { mode: 0o600 }).catch(
@@ -216,7 +217,7 @@ function startDaemonWatcher(
           ok: false,
           error: `timeout waiting for DONE: reply after ${INBOX_RESPONSE_TIMEOUT_MS}ms (req ${reqId})`,
         });
-        log(`fleet-v1 req ${reqId}: reply timeout`);
+        log(`fleet req ${reqId}: reply timeout`);
         return;
       }
       const done = doneLineOf(reply);
@@ -225,7 +226,7 @@ function startDaemonWatcher(
           ok: false,
           error: `empty reply: no trailing DONE: line found (req ${reqId})`,
         });
-        log(`fleet-v1 req ${reqId}: no DONE: line`);
+        log(`fleet req ${reqId}: no DONE: line`);
         return;
       }
       await writeRes(reqId, { ok: true, reply: reply.trim() });
@@ -234,7 +235,7 @@ function startDaemonWatcher(
       } catch {
         // notify is best-effort; never break the inbox path.
       }
-      log(`fleet-v1 req ${reqId}: DONE:${done}`);
+      log(`fleet req ${reqId}: DONE:${done}`);
     } catch (err) {
       const text = toReadableError(err);
       try {
@@ -242,7 +243,7 @@ function startDaemonWatcher(
       } catch {
         // writeRes failing must not crash the watcher.
       }
-      log(`fleet-v1 req ${reqId} error: ${text}`);
+      log(`fleet req ${reqId} error: ${text}`);
     }
   }
 
@@ -264,7 +265,7 @@ function startDaemonWatcher(
         const text = assistantTextOf(messageListOf(raw), beforeTime);
         if (text !== null && doneLineOf(text) !== null) return text;
       } catch (err) {
-        log(`fleet-v1 reply poll error: ${toReadableError(err)}`);
+        log(`fleet reply poll error: ${toReadableError(err)}`);
       }
       await new Promise((r) =>
         setTimeout(r, Math.min(RESPONSE_POLL_MS, Math.max(0, remaining))),
@@ -323,7 +324,7 @@ function makeV1Runtime(
     },
     log: (level: LogLevel, msg: string) => {
       try {
-        void c.app?.log?.({ body: { service: "fleet-v1", level, message: msg } });
+        void c.app?.log?.({ body: { service: "fleet", level, message: msg } });
       } catch {
         // best-effort only; never use console.log in plugins.
       }
@@ -357,14 +358,14 @@ export async function server(input: PluginInput) {
   const appLog = async (message: string, level: "info" | "warn" | "error" | "debug" = "info"): Promise<void> => {
     try {
       await client.app.log({
-        body: { service: "fleet-v1", level, message },
+        body: { service: "fleet", level, message },
       });
     } catch {
       // best-effort
     }
   };
 
-  await appLog(`fleet.v1 loaded daemon=${daemonId} dir=${input.directory} v1bin=${V1_BIN} v1=${V1_VERSION}`);
+  await appLog(`fleet loaded daemon=${daemonId} dir=${input.directory} v1bin=${V1_BIN} v1=${V1_VERSION}`);
 
   // v1-only enforcement: warn + skip watcher work on version/daemon mismatch.
   // Version source: client if it exposes one, else OPENCODE_VERSION env.
@@ -379,7 +380,7 @@ export async function server(input: PluginInput) {
     const reason = !v1Daemon
       ? `non-v1 daemon serverUrl=${serverUrlStr} (skips .bun / port 49374)`
       : `version mismatch version=${versionStr || "(unknown)"} expected=${V1_VERSION}`;
-    await appLog(`fleet.v1 WARN v1-only guard: ${reason}; inbox watcher disabled`, "warn");
+    await appLog(`fleet WARN v1-only guard: ${reason}; inbox watcher disabled`, "warn");
   }
 
   let watcher: DaemonWatcher | null = null;

@@ -1,22 +1,22 @@
-# opencode-fleet-v1
+# opencode-fleet
 
-Lightweight orchestrator → workers for OpenCode v1 (file spool + `prompt_async`, takeover-friendly).
+Lightweight orchestrator → workers for OpenCode (file spool + `prompt_async`, takeover-friendly; v1+v2 compatible).
 
 One commander session fans out self-contained tasks to all registered worker sessions, watches `DONE:` replies, and reports back. Every delegation lands as a **normal user message**, so manual takeover with `revert / fork / continue` keeps working. Killing the commander never breaks workers.
 
-> Scope: **v1 only** (`opencode` 1.18.32 via `/opt/homebrew/bin/opencode`). No v2, no A2A.
+> Scope: **v1+v2** (plugin id `fleet`; v1 `opencode` 1.18.32 via `/opt/homebrew/bin/opencode`, v2 `2.0.16+`).
 
 ## Install
 
 ```jsonc
 // opencode.jsonc (v1 shape)
-{ "plugin": ["file:/Users/duytrinh/Code/opencode-fleet-v1"] }
+{ "plugin": ["file:/Users/duytrinh/Code/opencode-fleet"] }
 ```
 
 Or from npm once published:
 
 ```jsonc
-{ "plugin": ["@bojackduy/opencode-fleet-v1"] }
+{ "plugin": ["@bojackduy/opencode-fleet"] }
 ```
 
 ## Tools
@@ -39,7 +39,7 @@ Or from npm once published:
 Delegated prompts are wrapped as:
 
 ```
-[from fleet-v1 <reqId> | commander:<id>]
+[from fleet <reqId> | commander:<id>]
 <self-contained task>
 Reply ending with exactly: DONE:<one-line-result>
 ```
@@ -54,18 +54,18 @@ migrates the v1 `plugin` list and loads the dual-shape `dist/index.js`
 
 ```jsonc
 // already have this? nothing to add — it loads on v2 too.
-{ "plugin": ["file:/Users/duytrinh/Code/opencode-fleet-v1"] }
+{ "plugin": ["file:/Users/duytrinh/Code/opencode-fleet"] }
 ```
 
 Otherwise:
 
 ```sh
-opencode2 plugin add @bojackduy/opencode-fleet-v1
+opencode2 plugin add @bojackduy/opencode-fleet
 ```
 
 ```jsonc
 // opencode.jsonc (v2 shape)
-{ "plugins": ["@bojackduy/opencode-fleet-v1"] }
+{ "plugins": ["@bojackduy/opencode-fleet"] }
 ```
 
 Caveats:
