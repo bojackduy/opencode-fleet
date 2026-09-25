@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "@bojackduy/opencode-fleet-v1",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Lightweight orchestrator → workers for OpenCode v1 (file spool + prompt_async, takeover-friendly).",
   "type": "module",
   "main": "dist/index.js",
