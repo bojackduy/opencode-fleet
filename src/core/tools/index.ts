@@ -1,6 +1,9 @@
 /**
- * tools/index.ts — the 19 runtime-agnostic fleet tool definitions, in the
- * same order the v1 plugin has always registered them.
+ * tools/index.ts — the runtime-agnostic fleet tool definitions: the 20
+ * pre-existing tools in the same order the v1 plugin has always registered
+ * them, plus the 5 Phase A exclusive-ownership tools (fleet_assign,
+ * fleet_unassign, fleet_transfer, fleet_my_workers, fleet_unassigned) plus
+ * Phase B1 per-commander watch/ack (fleet_watch scoped, fleet_ack).
  */
 
 import type { ToolDef } from "../toolDef.js";
@@ -24,7 +27,14 @@ import {
   fleetReleaseCommanderDef,
   fleetTreeDef,
 } from "./fleetRoles.js";
-import { fleetWatchDef } from "./fleetWatch.js";
+import { fleetWatchDef, fleetAckDef } from "./fleetWatch.js";
+import {
+  fleetAssignDef,
+  fleetMyWorkersDef,
+  fleetTransferDef,
+  fleetUnassignedDef,
+  fleetUnassignDef,
+} from "./fleetAssign.js";
 
 export const ALL_TOOL_DEFS: readonly ToolDef[] = [
   fleetRegisterDef,
@@ -47,4 +57,10 @@ export const ALL_TOOL_DEFS: readonly ToolDef[] = [
   fleetReleaseCommanderDef,
   fleetTreeDef,
   fleetWatchDef,
+  fleetAckDef,
+  fleetAssignDef,
+  fleetUnassignDef,
+  fleetTransferDef,
+  fleetMyWorkersDef,
+  fleetUnassignedDef,
 ];

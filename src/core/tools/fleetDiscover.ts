@@ -1,13 +1,21 @@
 /**
- * fleetDiscover.ts — Phase P1 `fleet_discover` + `fleet_ps` tools.
+ * fleetDiscover.ts — Phase P1 `fleet_discover` + `fleet_ps` tools,
+ * Phase B2 ownership-annotated.
  *
- * Read-only discovery over sqlite + registry + ps. Never throws —
+ * Read-only discovery over sqlite + registry + ps. These stay OPEN (no
+ * commander gate: discovery must work before a worker is claimed), but
+ * every registered row carries its ownership annotation (owning commander
+ * session, `unassigned` when claimable, `unknown` when assignment state is
+ * unreadable, `ambiguous(N)` on bare-id collisions). Claiming is via
+ * `fleet_assign`; control never happens from here. Never throws —
  * failures render as readable text.
  */
 
 import { depsOf, z } from "../toolDef.js";
 import type { ToolDef } from "../toolDef.js";
 import { discoverSessionsPreferApi, fleetPs } from "../discover.js";
+import { readAssignments } from "../assignments.js";
+import { shortSessionOf } from "../ownershipControl.js";
 
 export interface FleetToolDeps {
   // biome-ignore lint/suspicious/noExplicitAny: v1 plugin client is untyped at the boundary.
@@ -38,6 +46,38 @@ function timeAgo(timeUpdated: number, now = Date.now()): string {
   }
 }
 
+/** Bare sessionId -> owning commander sessions (ownership annotation). Never throws. */
+async function ownerAnnotations(): Promise<Map<string, string[]> | null> {
+  try {
+    const asg = await readAssignments();
+    if (asg.status === "corrupt" || asg.status === "error") return null;
+    const map = new Map<string, string[]>();
+    for (const a of Object.values(asg.state.assignments)) {
+      const worker = shortSessionOf(a.workerKey);
+      const owner = shortSessionOf(a.commanderKey);
+      const list = map.get(worker) ?? [];
+      if (!list.includes(owner)) list.push(owner);
+      map.set(worker, list);
+    }
+    return map;
+  } catch {
+    return null;
+  }
+}
+
+/** One owner cell: `unassigned` (claimable), owner id, `a+b` on collision, `unknown` when unreadable. */
+function ownerCell(sessionId: string, owners: Map<string, string[]> | null): string {
+  try {
+    if (owners === null) return "unknown";
+    const list = owners.get(String(sessionId ?? "")) ?? [];
+    if (list.length === 0) return "unassigned";
+    if (list.length === 1) return list[0] as string;
+    return `ambiguous(${list.length}):${list.join("+")}`;
+  } catch {
+    return "unknown";
+  }
+}
+
 function shortDir(dir: string, max = 48): string {
   try {
     if (dir.length <= max) return dir;
@@ -59,11 +99,12 @@ export async function fleetDiscoverHandler(args: any, _context: any, _deps?: Fle
     const rows = await discoverSessionsPreferApi(_deps?.client, limit);
     if (rows.length === 0) return "no sessions discovered";
     const now = Date.now();
-    const lines = ["sessionId | title | dir | updated | registered"];
+    const owners = await ownerAnnotations();
+    const lines = ["sessionId | title | dir | updated | registered | owner"];
     for (const r of rows.slice(0, limit)) {
       const title = r.title.replace(/\s+/g, " ").trim().slice(0, 60) || "-";
       lines.push(
-        `${r.id} | ${title} | ${shortDir(r.directory)} | ${timeAgo(r.timeUpdated, now)} | ${r.registered ? "yes" : "no"}`,
+        `${r.id} | ${title} | ${shortDir(r.directory)} | ${timeAgo(r.timeUpdated, now)} | ${r.registered ? "yes" : "no"} | ${ownerCell(r.id, owners)}`,
       );
     }
     return lines.join("\n");
@@ -77,11 +118,12 @@ export async function fleetPsHandler(_args: any, _context: any, _deps?: FleetToo
   try {
     const rows = await fleetPs(50, _deps?.client);
     if (rows.length === 0) return "no sessions discovered";
-    const lines = ["sessionId | title | dir | pid | port | registered | age"];
+    const owners = await ownerAnnotations();
+    const lines = ["sessionId | title | dir | pid | port | registered | age | owner"];
     for (const r of rows) {
       const title = r.title.replace(/\s+/g, " ").trim().slice(0, 50) || "-";
       lines.push(
-        `${r.sessionId} | ${title} | ${shortDir(r.directory, 40)} | ${r.pidHint || "-"} | ${r.portHint || "-"} | ${r.registered ? "yes" : "no"} | ${r.age}`,
+        `${r.sessionId} | ${title} | ${shortDir(r.directory, 40)} | ${r.pidHint || "-"} | ${r.portHint || "-"} | ${r.registered ? "yes" : "no"} | ${r.age} | ${ownerCell(r.sessionId, owners)}`,
       );
     }
     return lines.join("\n");
@@ -93,7 +135,7 @@ export async function fleetPsHandler(_args: any, _context: any, _deps?: FleetToo
 export const fleetDiscoverDef: ToolDef = {
   name: "fleet_discover",
   description:
-    "Discover v1 sessions from the shared sqlite DB joined with the fleet registry (read-only, newest first).",
+    "Discover v1 sessions from the shared sqlite DB joined with the fleet registry (read-only, newest first; ownership-annotated).",
   args: {
     limit: z.number().optional().describe("Max sessions to show (default 15)"),
   },
@@ -103,7 +145,7 @@ export const fleetDiscoverDef: ToolDef = {
 export const fleetPsDef: ToolDef = {
   name: "fleet_ps",
   description:
-    "Show fleet processes merged from ps/lsof + sqlite + registry with pid/port hints (read-only, v1 only).",
+    "Show fleet processes merged from ps/lsof + sqlite + registry with pid/port hints (read-only, v1 only; ownership-annotated).",
   args: {},
   run: (args, callCtx, rt) => fleetPsHandler(args, callCtx, depsOf(rt)),
 };

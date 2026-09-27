@@ -21,9 +21,10 @@ import { DONE_FOOTER, buildInjectText } from "../inbox.js";
 import { atomicWriteJson, cleanupReq, readRes, writeReq } from "../fileTransport.js";
 import type { FleetEnvelope } from "../fileTransport.js";
 import { notifyPath } from "../notify.js";
-import { canExecDetail, denyText } from "../auth.js";
-import { listRegistry, runtimeOf } from "../registry.js";
+import { listRegistry, runtimeOf, fleetKeyOf } from "../registry.js";
 import type { RegistryEntry } from "../registry.js";
+import { gateSendToWorker, scopedViewFor, stampEnvelope, validateDelivery } from "../ownershipControl.js";
+import { originFromStamped, recordHandoffOriginStrict } from "../ownershipControl.js";
 
 export interface FleetToolDeps {
   // biome-ignore lint/suspicious/noExplicitAny: v1 plugin client is untyped at the boundary.
@@ -83,6 +84,31 @@ function formatResult(r: TargetResult): string {
   return `${r.sessionId}: error: ${r.error ?? "unknown error"}`;
 }
 
+/**
+ * Persist the durable handoff origin for an ACCEPTED in-process delegation
+ * (no .req file exists on this path, so the spool watcher cannot record
+ * it). Generation-guarded against concurrent overwrites. Returns a visible
+ * warning when the stamp is missing or persistence fails — callers append it
+ * to the reply, never silently claim takeover works. Spool targets must NOT
+ * call this (the watcher is the single writer there).
+ */
+async function persistAcceptedOrigin(envelope: FleetEnvelope): Promise<string | null> {
+  try {
+    const origin = originFromStamped(envelope);
+    if (!origin) return "WARNING: handoff origin not persisted (missing ownership stamp)";
+    try {
+      await recordHandoffOriginStrict(origin);
+      return null;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message || String(err) : String(err);
+      return `WARNING: handoff origin not persisted (${msg})`;
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message || String(err) : String(err);
+    return `WARNING: handoff origin not persisted (${msg})`;
+  }
+}
+
 export async function fleetBroadcastHandler(
   args: any,
   context: any,
@@ -97,26 +123,20 @@ export async function fleetBroadcastHandler(
     const force = args?.force === true;
     const rt = deps?.rt;
 
-    // P5 auth gate: broadcast-level check (from must be commander).
-    const freshAuth = await listRegistry({ includeSelf: true }).catch(() => []);
-    try {
-      const verdict = await canExecDetail(selfId, "broadcast", freshAuth, { force });
-      if (verdict.allowed === false) {
-        return `fleet_broadcast ${denyText(verdict.reason)}`;
-      }
-      if (verdict.allowed === "hold") {
-        const freshHold = await listRegistry({ includeSelf: true });
-        const targetsHold = holdTargets(freshHold.map((e) => e.sessionId));
-        if (targetsHold.length === 0) return "no workers registered";
-        const heldLines = await Promise.all(targetsHold.map((id) => queueHeld(id)));
-        return heldLines.join("\n");
-      }
-    } catch {
-      // auth never blocks on its own failure — fall through to broadcast.
+    // Phase B2: per-commander scope. The caller must be an authorized
+    // commander (fail-closed); the default target set is ONLY workers owned
+    // by the caller (never the whole registry). Explicit `only` targets are
+    // gated per worker (not-owned / owned-by-other / ambiguous fail per
+    // target, never silently sent). force never bypasses ownership.
+    const view = await scopedViewFor(context as any, rt);
+    if (!view.ok) {
+      return `fleet_broadcast failed: ${view.error ?? "commander resolution failed; refusing (fail-closed)"}`;
     }
+    void force; // ownership-exclusive: force cannot widen scope (kept for compat).
 
     const fresh = await listRegistry({ includeSelf: true });
     const byId = new Map(fresh.map((e) => [e.sessionId, e]));
+    const byKey = new Map(fresh.map((e) => [fleetKeyOf(e), e]));
 
     function holdTargets(allIds: string[]): string[] {
       const onlyRawInner = Array.isArray(args?.only) ? (args.only as unknown[]) : undefined;
@@ -161,8 +181,12 @@ export async function fleetBroadcastHandler(
         : undefined;
 
     if (!only) {
-      const defaults = fresh.filter((e) => e.sessionId !== selfId);
-      if (defaults.length === 0) return "no workers registered";
+      const defaults = [...view.ownedKeys]
+        .map((k) => byKey.get(k))
+        .filter((e): e is RegistryEntry => !!e && e.sessionId !== selfId);
+      if (defaults.length === 0) {
+        return `no workers assigned to you (claim workers with fleet_assign first)`;
+      }
       return (await Promise.all(defaults.map((e) => sendToOne(e)))).map(
         formatResult,
       ).join("\n");
@@ -170,47 +194,73 @@ export async function fleetBroadcastHandler(
 
     const results = await Promise.all(
       only.map(async (id): Promise<TargetResult> => {
-        const entry = byId.get(id);
+        // Per-target ownership gate (bare id must be unambiguous; force
+        // never bypasses ownership; policy hold/refuse enforced in gate).
+        const gate = await gateSendToWorker(context as any, rt, { sessionId: id }, { force });
+        if (!gate.ok) {
+          if (gate.held) {
+            await queueHeld(id);
+            return { sessionId: id, ok: false, error: "held for approval, use fleet_allow" };
+          }
+          return { sessionId: id, ok: false, error: gate.error };
+        }
+        const entry = byKey.get(gate.workerKey) ?? byId.get(id);
         if (!entry) return { sessionId: id, ok: false, error: "not in registry" };
-        return sendToOne(entry);
+        return sendToOne(entry, gate);
       }),
     );
     return results.map(formatResult).join("\n");
 
-    async function sendToOne(entry: RegistryEntry): Promise<TargetResult> {
+    async function sendToOne(
+      entry: RegistryEntry,
+      preGate?: Extract<Awaited<ReturnType<typeof gateSendToWorker>>, { ok: true }>,
+    ): Promise<TargetResult> {
       const targetSessionId = entry.sessionId;
       const targetDaemonId = entry.daemonId;
-      // P5 per-target role check (commander->commander needs force).
-      try {
-        const per = await canExecDetail(selfId, targetSessionId, fresh, { force });
-        if (per.allowed === "hold") {
+      // Gate when not already gated (default owner-only path).
+      const gate = preGate ?? (await gateSendToWorker(context as any, rt, { sessionId: targetSessionId }, { force }));
+      if (!gate.ok) {
+        if (gate.held) {
           await queueHeld(targetSessionId);
           return { sessionId: targetSessionId, ok: false, error: "held for approval, use fleet_allow" };
         }
-        if (per.allowed === false) {
-          return { sessionId: targetSessionId, ok: false, error: denyText(per.reason) };
-        }
-      } catch {
-        // auth never blocks on its own failure — fall through to send.
+        return { sessionId: targetSessionId, ok: false, error: gate.error };
       }
       const reqId = `req-${Date.now()}-${randomSuffix()}`;
-      const envelope: FleetEnvelope = {
-        reqId,
-        fromCommander: selfId,
-        targetSessionId,
-        targetDaemonId,
-        message: ensureDoneInstruction(message),
-        createdAt: Date.now(),
-        hop: 0,
-        ...(typeof args?.agent === "string" && args.agent !== "" ? { agent: args.agent } : {}),
-        ...(typeof args?.model === "string" && args.model !== "" ? { model: args.model } : {}),
-        ...(typeof args?.variant === "string" && args.variant !== "" ? { variant: args.variant } : {}),
-        ...(typeof args?.system === "string" && args.system !== "" ? { system: args.system } : {}),
-      };
+      const envelope: FleetEnvelope = stampEnvelope(
+        {
+          reqId,
+          fromCommander: selfId,
+          targetSessionId,
+          targetDaemonId,
+          message: ensureDoneInstruction(message),
+          createdAt: Date.now(),
+          hop: 0,
+          ...(typeof args?.agent === "string" && args.agent !== "" ? { agent: args.agent } : {}),
+          ...(typeof args?.model === "string" && args.model !== "" ? { model: args.model } : {}),
+          ...(typeof args?.variant === "string" && args.variant !== "" ? { variant: args.variant } : {}),
+          ...(typeof args?.system === "string" && args.system !== "" ? { system: args.system } : {}),
+        },
+        gate,
+      );
       // Part 2 fast path: same v2 process → in-process prompt + DONE poll.
       // Anything else (incl. v2 commander→v1 and v1→v2) goes through the spool,
       // which the owning daemon's watcher claims as a normal user message.
       if (rt?.kind === "v2" && runtimeOf(entry) === "v2" && rt.daemonId === entry.daemonId) {
+        // Pre-prompt revalidation (same gate the spool watcher runs at
+        // delivery). Narrow unavoidable TOCTOU: an already-accepted prompt
+        // cannot be recalled after a concurrent transfer — only queued
+        // requests are reliably rejected after the move.
+        try {
+          const verdict = await validateDelivery(envelope, {
+            receiver: { runtime: runtimeOf(entry), daemonId: entry.daemonId, sessionId: targetSessionId },
+          });
+          if (!verdict.ok) {
+            return { sessionId: targetSessionId, ok: false, error: `in-process denied: ${verdict.error}` };
+          }
+        } catch {
+          return { sessionId: targetSessionId, ok: false, error: "in-process denied: revalidation failed; refusing (fail-closed)" };
+        }
         try {
           const since = Date.now();
           await rt.promptLocal(targetSessionId, buildInjectText(envelope), {
@@ -219,14 +269,19 @@ export async function fleetBroadcastHandler(
             ...(envelope.variant ? { variant: envelope.variant } : {}),
             ...(envelope.system ? { system: envelope.system } : {}),
           });
+          // Accepted in-process: persist origin before the DONE poll so
+          // timeouts/no-poll still leave takeover working. Never spool after
+          // this (would double-deliver); each broadcast target is independent.
+          const originWarning = await persistAcceptedOrigin(envelope);
+          const suffix = originWarning ? ` (${originWarning})` : "";
           let reply: string | null = null;
           try {
             reply = (await rt.waitForDone?.(targetSessionId, since, timeoutMs, signal)) ?? null;
           } catch {
             reply = null;
           }
-          if (reply !== null) return { sessionId: targetSessionId, ok: true, reply };
-          return { sessionId: targetSessionId, ok: true, reply: "injected via in-process; DONE poll unavailable" };
+          if (reply !== null) return { sessionId: targetSessionId, ok: true, reply: reply + suffix };
+          return { sessionId: targetSessionId, ok: true, reply: `injected via in-process; DONE poll unavailable${suffix}` };
         } catch (err) {
           return { sessionId: targetSessionId, ok: false, error: `in-process failed: ${toReadableError(err)}` };
         }
@@ -268,7 +323,7 @@ export async function fleetBroadcastHandler(
 export const fleetBroadcastDef: ToolDef = {
   name: "fleet_broadcast",
   description:
-    "Broadcast a self-contained task to fleet workers and wait for their DONE: replies. Returns one result line per target worker.",
+    "Broadcast a self-contained task to fleet workers you own (default: all your owned workers only) and wait for their DONE: replies. Returns one result line per target worker.",
   args: {
     message: z
       .string()
@@ -276,7 +331,7 @@ export const fleetBroadcastDef: ToolDef = {
     only: z
       .array(z.string())
       .optional()
-      .describe("Target session ids; defaults to all registered workers except self"),
+      .describe("Target session ids (each must be owned by you); defaults to all workers you own"),
     agent: z.string().optional().describe("Optional agent hint replayed by the worker"),
     model: z
       .string()
@@ -291,7 +346,7 @@ export const fleetBroadcastDef: ToolDef = {
     force: z
       .boolean()
       .optional()
-      .describe("Override commander->commander deny per target (default false)"),
+      .describe("Override commander->commander deny per target (default false; never bypasses worker ownership)"),
   },
   run: (args, callCtx, rt) => fleetBroadcastHandler(args, callCtx, depsOf(rt)),
 };

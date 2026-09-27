@@ -54,6 +54,20 @@ import {
 } from "../core/fileTransport.js";
 import { writeNotify, writeRosterNotify } from "../core/notify.js";
 import {
+  doneNoteFor,
+  emitForWorkerIdentity,
+  emitOwnershipEvent,
+  emitToOwnersOfSession,
+  idleNoteFor,
+  snapshotOwnersForSession,
+} from "../core/ownershipEvents.js";
+import {
+  recordHandoffOrigin,
+  shortSessionOf,
+  validateDelivery,
+  validateHandoffDelivery,
+} from "../core/ownershipControl.js";
+import {
   passwordForUrl,
   pollV2Done,
   readV2ServiceCreds,
@@ -429,6 +443,10 @@ async function runEventLoop(
           type === "session.status"
         ) {
           const isJoin = type === "session.created";
+          const isDone =
+            type === "session.execution.succeeded" ||
+            type === "session.execution.failed" ||
+            type === "session.execution.interrupted";
           await heartbeatAndRegisterV2(rt, api, sessionId, location);
           if (isJoin) {
             try {
@@ -436,8 +454,52 @@ async function runEventLoop(
             } catch {
               // roster notify is best-effort
             }
+            // Scoped join to the assigned commander only.
+            try {
+              await emitForWorkerIdentity(
+                { runtime: "v2", daemonId: rt.daemonId, sessionId },
+                "join",
+                sessionId,
+              ).catch(() => null);
+            } catch {
+              // best-effort
+            }
+          } else if (isDone) {
+            // v2 execution-completed -> scoped DONE (snippet only).
+            try {
+              const d = (ev?.data ?? {}) as Record<string, unknown>;
+              const outcome =
+                typeof d["outcome"] === "string" ? String(d["outcome"]) :
+                typeof d["result"] === "string" ? String(d["result"]) : type;
+              await emitForWorkerIdentity(
+                { runtime: "v2", daemonId: rt.daemonId, sessionId },
+                "done",
+                doneNoteFor(outcome.slice(0, 200)),
+              ).catch(() => null);
+            } catch {
+              // best-effort
+            }
+          } else {
+            // idle / status -> scoped idle (dedup suppresses repeats).
+            try {
+              await emitForWorkerIdentity(
+                { runtime: "v2", daemonId: rt.daemonId, sessionId },
+                "idle",
+                idleNoteFor(""),
+              ).catch(() => null);
+            } catch {
+              // best-effort
+            }
           }
         } else if (type === "session.deleted") {
+          // Snapshot the owner BEFORE scoped removal so leave survives.
+          let snap: { workerKey: string; commanderKey: string }[] = [];
+          try {
+            const s = await snapshotOwnersForSession(sessionId);
+            if (!("error" in s)) snap = s.owners;
+          } catch {
+            snap = [];
+          }
           try {
             await removeSessionScoped(sessionId, { runtime: "v2" });
           } catch {
@@ -447,6 +509,16 @@ async function runEventLoop(
             await writeRosterNotify("leave", { sessionId, directory: location });
           } catch {
             // roster notify is best-effort
+          }
+          try {
+            for (const o of snap) {
+              await emitOwnershipEvent(o.workerKey, "leave", sessionId).catch(() => null);
+            }
+            if (snap.length === 0) {
+              await emitToOwnersOfSession(sessionId, "leave", sessionId).catch(() => null);
+            }
+          } catch {
+            // best-effort
           }
         }
       } catch (err) {
@@ -562,6 +634,48 @@ function startV2SpoolWatcher(log: Runtime["log"]): { stop: () => void } {
         log("warn", `fleet v2 req ${reqId}: ${text}`);
         return;
       }
+      // Phase B2 delivery-time revalidation (TOCTOU-safe; see v1 adapter):
+      // explicit kind dispatch — forward envelopes bind the stamp to the
+      // ACTUAL receiving session, handoff envelopes run the reverse gate.
+      if (envelope.kind === "handoff") {
+        const verdict = await validateHandoffDelivery(envelope, {
+          receiver: { runtime: "v2", daemonId: s.daemonId, sessionId: targetSessionId },
+        });
+        if (!verdict.ok) {
+          try {
+            await writeRes(reqId, { ok: false, error: verdict.error });
+          } catch {
+            // never crash the watcher
+          }
+          log("warn", `fleet v2 req ${reqId}: ${verdict.error}`);
+          return;
+        }
+      } else {
+        const verdict = await validateDelivery(envelope, {
+          receiver: { runtime: "v2", daemonId: s.daemonId, sessionId: targetSessionId },
+        });
+        if (!verdict.ok) {
+          try {
+            await writeRes(reqId, { ok: false, error: verdict.error });
+          } catch {
+            // never crash the watcher
+          }
+          log("warn", `fleet v2 req ${reqId}: ${verdict.error}`);
+          return;
+        }
+        try {
+          await recordHandoffOrigin({
+            workerKey: verdict.workerKey,
+            fromCommanderKey: verdict.commanderKey,
+            fromCommanderSession: shortSessionOf(verdict.commanderKey),
+            reqId,
+            generation: verdict.generation,
+            at: Date.now(),
+          });
+        } catch {
+          // origin persistence is best-effort
+        }
+      }
       await writeFile(claimedPath(reqId), s.daemonId, { mode: 0o600 }).catch(() => undefined);
       const injectText = buildInjectText(envelope);
       // Capture `since` BEFORE injection: the worker's reply is always
@@ -596,6 +710,20 @@ function startV2SpoolWatcher(log: Runtime["log"]): { stop: () => void } {
         if (envelope2) await writeNotify(reqId, envelope2, reply.trim());
       } catch {
         // notify is best-effort
+      }
+      // Phase B1: scoped DONE to the assigned commander only (snippet).
+      try {
+        const m = /^DONE:\s*(.+?)\s*$/gm;
+        let last = "";
+        let mm: RegExpExecArray | null;
+        while ((mm = m.exec(reply.trim())) !== null) last = (mm[1] ?? "").trim();
+        await emitForWorkerIdentity(
+          { runtime: "v2", daemonId: s.daemonId, sessionId: targetSessionId },
+          "done",
+          doneNoteFor(last !== "" ? last : reply.trim()),
+        ).catch(() => null);
+      } catch {
+        // scoped notify is best-effort
       }
       log("info", `fleet v2 req ${reqId}: DONE reply captured`);
     } catch (err) {

@@ -1,5 +1,6 @@
 node_modules/
 dist/
+.codegraph/
 
 # local progress notes (kept locally, not committed)
 fleet-progress-*.md

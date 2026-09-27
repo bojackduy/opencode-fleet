@@ -1,14 +1,17 @@
 /**
  * fleetAdmin.ts — P4 `fleet_allow` / `fleet_block` / `fleet_policy` /
- * `fleet_summary` / `fleet_group` tools.
+ * `fleet_summary` / `fleet_group` tools, Phase B2 per-commander scoped.
  *
  * Admin over the auth allowlist (commander ids) + registry summaries grouped
  * by directory/project/agent/status with counts + last DONE per group.
+ * `fleet_summary` / `fleet_group` summarize ONLY the calling commander's
+ * owned workers (fail-closed on unknown callers / unreadable state).
  * All tools are runtime-agnostic ToolDefs and never throw — failures render as readable text.
  */
 
 import { depsOf, z } from "../toolDef.js";
 import type { ToolDef } from "../toolDef.js";
+import type { Runtime } from "../runtime.js";
 import {
   addCommander,
   getPolicy,
@@ -16,12 +19,14 @@ import {
   removeCommander,
   setPolicy,
 } from "../auth.js";
-import { listRegistry } from "../registry.js";
+import type { RegistryEntry } from "../registry.js";
+import { scopedRegistryEntries } from "../ownershipControl.js";
 
 export interface FleetToolDeps {
   // biome-ignore lint/suspicious/noExplicitAny: v1 plugin client is untyped at the boundary.
   client?: any;
   serverUrl?: string | URL;
+  rt?: Runtime;
 }
 
 function toReadableError(err: unknown): string {
@@ -109,10 +114,9 @@ export async function fleetPolicyHandler(args: any, _context: any, _deps?: Fleet
   }
 }
 
-async function summarize(groupBy: GroupBy): Promise<string> {
+async function summarize(groupBy: GroupBy, entries: RegistryEntry[]): Promise<string> {
   try {
-    const entries = await listRegistry({ includeSelf: true }).catch(() => []);
-    if (entries.length === 0) return "no workers registered";
+    if (entries.length === 0) return "no workers assigned to you (claim workers with fleet_assign; unassigned discovery: fleet_unassigned)";
     const groups = new Map<string, { count: number; lastDone: string; lastAt: number }>();
     for (const e of entries) {
       let key = "-";
@@ -138,21 +142,21 @@ async function summarize(groupBy: GroupBy): Promise<string> {
   }
 }
 
-export async function fleetSummaryHandler(args: any, _context: any, _deps?: FleetToolDeps): Promise<string> {
-  void _context;
-  void _deps;
+export async function fleetSummaryHandler(args: any, context: any, deps?: FleetToolDeps): Promise<string> {
   try {
-    return await summarize(normalizeGroupBy(args?.groupBy));
+    const scoped = await scopedRegistryEntries(context as any, deps?.rt);
+    if (!scoped.ok) return `fleet_summary failed: ${scoped.error}`;
+    return await summarize(normalizeGroupBy(args?.groupBy), scoped.owned);
   } catch (err) {
     return `fleet_summary failed: ${toReadableError(err)}`;
   }
 }
 
-export async function fleetGroupHandler(args: any, _context: any, _deps?: FleetToolDeps): Promise<string> {
-  void _context;
-  void _deps;
+export async function fleetGroupHandler(args: any, context: any, deps?: FleetToolDeps): Promise<string> {
   try {
-    return await summarize(normalizeGroupBy(args?.groupBy));
+    const scoped = await scopedRegistryEntries(context as any, deps?.rt);
+    if (!scoped.ok) return `fleet_group failed: ${scoped.error}`;
+    return await summarize(normalizeGroupBy(args?.groupBy), scoped.owned);
   } catch (err) {
     return `fleet_group failed: ${toReadableError(err)}`;
   }
@@ -188,7 +192,7 @@ export const fleetPolicyDef: ToolDef = {
 
 export const fleetSummaryDef: ToolDef = {
   name: "fleet_summary",
-  description: "Summarize fleet workers grouped by directory|project|agent|status with counts + last DONE.",
+  description: "Summarize fleet workers you own grouped by directory|project|agent|status with counts + last DONE (per-commander scoped).",
   args: {
     groupBy: z.string().optional().describe("directory (default)|project|agent|status"),
   },
@@ -197,7 +201,7 @@ export const fleetSummaryDef: ToolDef = {
 
 export const fleetGroupDef: ToolDef = {
   name: "fleet_group",
-  description: "Group fleet workers like fleet_summary: counts + last DONE per group.",
+  description: "Group fleet workers you own like fleet_summary: counts + last DONE per group (per-commander scoped).",
   args: {
     groupBy: z.string().optional().describe("directory (default)|project|agent|status"),
   },

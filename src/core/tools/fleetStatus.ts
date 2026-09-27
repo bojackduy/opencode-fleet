@@ -1,9 +1,12 @@
 /**
- * fleetStatus.ts — Phase 3 `fleet_status` tool.
+ * fleetStatus.ts — Phase 3 `fleet_status` tool, Phase B2 per-commander scoped.
  *
- * Polls `client.session.status()` plus the last few `client.session.messages()`
- * per worker, extracts the trailing `DONE:` line, and renders a compact table.
- * Per-row failures are captured as readable cells — the tool never throws.
+ * Exactly ONE controlling commander per worker (see ../assignments.ts).
+ * Default rows cover ONLY the calling commander's owned workers. Explicit
+ * sessionIds are gated per worker via lookupAssignment: foreign, unassigned,
+ * stale, missing, or ambiguous ids render as readable error cells (never
+ * leak another commander's DONE lines). Caller identity ALWAYS comes from
+ * the tool context + runtime (fail-closed). Never throws.
  */
 
 import { depsOf, z } from "../toolDef.js";
@@ -11,6 +14,8 @@ import type { ToolDef } from "../toolDef.js";
 import type { Runtime } from "../runtime.js";
 import { listRegistry, runtimeOf } from "../registry.js";
 import type { RegistryEntry } from "../registry.js";
+import { lookupAssignment } from "../assignments.js";
+import { scopedRegistryEntries } from "../ownershipControl.js";
 import { messageListOf } from "../inbox.js";
 import { passwordForUrl, v2ActiveMap, v2AssistantText } from "../v2transport.js";
 
@@ -82,22 +87,33 @@ function statusOf(statusMap: any, sessionId: string): string {
 
 export async function fleetStatusHandler(
   args: any,
-  _context: any,
+  context: any,
   deps?: FleetToolDeps,
 ): Promise<string> {
-  void _context;
   try {
     const client = deps?.client;
     const rt = deps?.rt;
+
+    // Phase B2 scope: commander resolution first (fail-closed).
+    const scoped = await scopedRegistryEntries(context as any, rt);
+    if (!scoped.ok) return `fleet_status failed: ${scoped.error}`;
 
     const requested = Array.isArray(args?.sessionIds)
       ? (args.sessionIds as unknown[]).filter((s): s is string => typeof s === "string" && s !== "")
       : [];
     const entries = await listRegistry({ includeSelf: true });
     const byId = new Map(entries.map((e) => [e.sessionId, e]));
-    const ids =
-      requested.length > 0 ? requested : entries.map((e) => e.sessionId);
-    if (ids.length === 0) return "no workers registered";
+    let ids: string[];
+    if (requested.length > 0) {
+      ids = requested;
+    } else {
+      ids = scoped.owned.map((e) => e.sessionId);
+    }
+    if (ids.length === 0) {
+      return requested.length > 0
+        ? "no matching workers"
+        : `no workers assigned to you (claim workers with fleet_assign; unassigned discovery: fleet_unassigned)`;
+    }
 
     // v1 rows on a v1 commander keep the live client.session.status path.
     const v1Local = client && rt?.kind !== "v2"
@@ -115,6 +131,27 @@ export async function fleetStatusHandler(
 
     const rows = await Promise.all(
       ids.map(async (id): Promise<string> => {
+        // Phase B2 per-row ownership gate (explicit ids only; the default
+        // set is already owned). Foreign/unassigned/stale/missing/
+        // ambiguous ids render as error cells — no DONE leak.
+        if (requested.length > 0) {
+          const gate = await lookupAssignment({ sessionId: id }, scoped.callerKey);
+          if (gate.kind === "ambiguous" || gate.kind === "not-found") {
+            return `${id} | error | - | ${gate.error ?? "not in registry"}`;
+          }
+          if (gate.kind === "error") {
+            return `${id} | error | - | ${gate.error ?? "lookup failed"}`;
+          }
+          if (gate.kind === "unassigned") {
+            return `${id} | error | - | ${id} is not assigned to you (unassigned; claim it with fleet_assign first)`;
+          }
+          if (gate.kind === "stale") {
+            return `${id} | error | - | ${id} has a stale assignment (worker row gone); release or re-claim via fleet_assign`;
+          }
+          if (gate.kind === "owned-by-other") {
+            return `${id} | error | - | ${id} is owned by ${gate.ownerSessionId ?? "?"}; only the owning commander can check it`;
+          }
+        }
         if (v1Local.includes(id)) {
           try {
             const status = statusOf(statusMap, id);
@@ -205,12 +242,12 @@ async function statusRowForRemote(
 export const fleetStatusDef: ToolDef = {
   name: "fleet_status",
   description:
-    "Show live status per fleet worker: session status, trailing DONE: line, and last assistant message snippet.",
+    "Show live status per fleet worker you own (per-commander scoped): session status, trailing DONE: line, and last assistant message snippet.",
   args: {
     sessionIds: z
       .array(z.string())
       .optional()
-      .describe("Session ids to check; defaults to all registered workers"),
+      .describe("Owned session ids to check (each must be owned by you); defaults to all workers you own"),
   },
   run: (args, callCtx, rt) => fleetStatusHandler(args, callCtx, depsOf(rt)),
 };

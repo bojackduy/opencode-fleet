@@ -23,9 +23,15 @@ import type { Runtime } from "../runtime.js";
 import { buildInjectText, DONE_FOOTER } from "../inbox.js";
 import { chainRefsOf, hopOf, isHopExceeded, loopGuardText, messagesDir, readReq, writeReq } from "../fileTransport.js";
 import type { FleetEnvelope } from "../fileTransport.js";
-import { listRegistry, runtimeOf } from "../registry.js";
+import { listRegistry, fleetKeyOf } from "../registry.js";
 import { readNotify } from "../notify.js";
 import { passwordForUrl, v2PromptRemote } from "../v2transport.js";
+import { callerIdentity } from "./fleetAssign.js";
+import {
+  gateHandoffSend,
+  readHandoffOrigin,
+  validateHandoffDelivery,
+} from "../ownershipControl.js";
 
 export interface FleetToolDeps {
   // biome-ignore lint/suspicious/noExplicitAny: v1 plugin client is untyped at the boundary.
@@ -129,50 +135,88 @@ export async function fleetHandoffBackHandler(
     const selfId = selfIdOf(context);
 
     const inbound = await findLatestInbound(selfId);
-    if (!inbound) {
-      return `fleet_handoff_back failed: no inbound delegation found for this session (no .req.json targeting self${selfId ? ` ${selfId}` : ""})`;
+    // Phase B2 durable handoff routing: the worker identity comes from the
+    // tool context composite (no spoofing via envelope fields or explicit
+    // args — this handler takes no target args), and the handoff routes to
+    // the CURRENT owner (transfer-aware) via gateHandoffSend. The persisted
+    // origin survives commander-side .req cleanup; the inbound envelope's
+    // fromCommander is kept as audit only. When the assignment is gone
+    // (unassign raced the handoff) the gate returns a readable unassigned
+    // error — never a fallback route to the old origin commander.
+    const workerIdent = callerIdentity(context as any, deps?.rt);
+    const workerKey =
+      workerIdent.sessionId !== "" && workerIdent.daemonId !== ""
+        ? fleetKeyOf(workerIdent)
+        : null;
+    let origin: Awaited<ReturnType<typeof readHandoffOrigin>> = null;
+    if (workerKey) {
+      try {
+        origin = await readHandoffOrigin(workerKey);
+      } catch {
+        origin = null;
+      }
     }
-    const commanderId = (inbound.fromCommander ?? "").trim();
-    if (commanderId === "") {
-      return `fleet_handoff_back failed: inbound req ${inbound.reqId} has no fromCommander`;
+    if (!inbound && !origin) {
+      return `fleet_handoff_back failed: no inbound delegation found for this session (no .req.json targeting self${selfId ? ` ${selfId}` : ""} and no durable handoff origin)`;
     }
+    // Reverse send gate: resolves the CURRENT owner by composite key,
+    // rejecting ambiguity, stale owners, and unassigned workers (fail-closed).
+    const gate = await gateHandoffSend(context as any, deps?.rt);
+    if (!gate.ok) {
+      return `fleet_handoff_back failed: ${gate.error}`;
+    }
+    // No live .req (commander cleaned up after reading) but a durable
+    // origin persists: hand back against the origin thread.
+    const threadReqId = origin?.reqId ?? inbound?.reqId ?? "";
+    const commanderId = gate.targetSessionId;
+    const auditOrigin = origin?.fromCommanderSession ?? inbound?.fromCommander ?? "";
 
-    // Resolve the commander's daemon + runtime for the transport choice.
-    let targetDaemonId: string | undefined;
-    let commanderRuntime: "v1" | "v2" = "v1";
+    // Target daemon + runtime come from the gate's composite resolution
+    // (never a bare-sessionId scan that could pick a colliding row).
+    const targetDaemonId: string | undefined = gate.targetDaemonId;
+    const commanderRuntime: "v1" | "v2" = gate.targetRuntime;
     let commanderUrl = "";
     try {
       const fresh = await listRegistry({ includeSelf: true });
-      const entry = fresh.find((e) => e.sessionId === commanderId);
-      if (entry) {
-        targetDaemonId = entry.daemonId;
-        commanderRuntime = runtimeOf(entry);
-        if (typeof entry.endpoint?.url === "string") commanderUrl = entry.endpoint.url.trim();
-        if (commanderUrl === "" && entry.daemonId.startsWith("v2:")) {
-          commanderUrl = entry.daemonId.slice("v2:".length);
-        }
+      const entry = fresh.find((e) => fleetKeyOf(e) === gate.commanderKey);
+      const urlRaw = (entry as { endpoint?: { url?: unknown } } | undefined)?.endpoint?.url;
+      if (typeof urlRaw === "string" && urlRaw.trim() !== "") commanderUrl = urlRaw.trim();
+      if (commanderUrl === "" && gate.targetDaemonId.startsWith("v2:")) {
+        commanderUrl = gate.targetDaemonId.slice("v2:".length);
       }
     } catch {
-      // registry is best-effort; spool still works without targetDaemonId.
+      // registry is best-effort; spool still works without commanderUrl.
     }
 
     // P5 loop guard: the reverse handoff extends the chain by one hop.
     // NOTE: handoff_back intentionally bypasses the commander role check
     // (worker->commander reverse is always allowed) but stays loop-guarded.
-    const hop = hopOf(inbound) + 1;
+    // Origin-only handoffs (no live .req) start the chain at hop 1.
+    const hop = (inbound ? hopOf(inbound) : 0) + 1;
     if (isHopExceeded({ hop })) {
-      return `fleet_handoff_back ${loopGuardText(`handoff-after-${inbound.reqId}`, hop)}`;
+      return `fleet_handoff_back ${loopGuardText(`handoff-after-${threadReqId}`, hop)}`;
     }
 
     const reqId = `handoff-${Date.now()}-${randomSuffix()}`;
     const raw =
-      `${message.trim()}\nRe: ${inbound.reqId}` +
-      (doneRaw !== "" ? `\nSuggested result: DONE:${doneRaw}` : "");
+      `${message.trim()}\nRe: ${threadReqId}` +
+      (doneRaw !== "" ? `\nSuggested result: DONE:${doneRaw}` : "") +
+      (auditOrigin !== "" && auditOrigin !== commanderId ? `\n(origin: ${auditOrigin})` : "");
     const envelope: FleetEnvelope = {
       reqId,
+      kind: "handoff",
       fromCommander: selfId,
       targetSessionId: commanderId,
       ...(targetDaemonId ? { targetDaemonId } : {}),
+      // Reverse stamp: workerKey = the sending worker, commanderKey = the
+      // current owner at send time, generation = assignment CAS. The
+      // receiving commander's watcher revalidates all three plus the durable
+      // origin before delivery; only valid handoffs bypass the regular
+      // worker-delivery stamp.
+      workerKey: gate.workerKey,
+      commanderKey: gate.commanderKey,
+      generation: gate.generation,
+      ...(threadReqId !== "" ? { originReqId: threadReqId } : {}),
       message: raw,
       createdAt: Date.now(),
       hop,
@@ -189,19 +233,43 @@ export async function fleetHandoffBackHandler(
     // (1) same v2 process → in-process promptLocal (lands as user bubble);
     // (2) remote v2 service → HTTP prompt; (3) v1 same-daemon → promptAsync;
     // (4) spool fallback (claimed by the owning daemon's watcher).
+    //
+    // Each live prompt revalidates the reverse stamp immediately before
+    // injecting (same gate the commander's spool watcher runs at delivery).
+    // Narrow unavoidable TOCTOU: once the target runtime ACCEPTS the prompt,
+    // a concurrent unassign/transfer cannot recall the injected user bubble —
+    // only queued (spool) handoffs are reliably rejected after the move.
+    const handoffReceiver = {
+      runtime: gate.targetRuntime,
+      daemonId: gate.targetDaemonId,
+      sessionId: gate.targetSessionId,
+    } as const;
+    async function reverseGateOk(): Promise<string | null> {
+      try {
+        const verdict = await validateHandoffDelivery(envelope, { receiver: { ...handoffReceiver } });
+        if (!verdict.ok) return `fleet_handoff_back failed: ${verdict.error}`;
+        return null;
+      } catch {
+        return "fleet_handoff_back failed: handoff revalidation failed; refusing (fail-closed)";
+      }
+    }
     if (commanderRuntime === "v2" && rt?.kind === "v2" && targetDaemonId !== undefined && rt.daemonId === targetDaemonId) {
+      const denied = await reverseGateOk();
+      if (denied) return denied;
       try {
         await rt.promptLocal(commanderId, inject);
-        return `handed back to ${commanderId} via:in-process (req ${reqId} Re: ${inbound.reqId})`;
+        return `handed back to ${commanderId} via:in-process (req ${reqId} Re: ${threadReqId})`;
       } catch {
         // fall through to remote/spool
       }
     }
     if (commanderRuntime === "v2" && commanderUrl !== "" && !commanderUrl.startsWith("pid:")) {
+      const denied = await reverseGateOk();
+      if (denied) return denied;
       try {
         const pw = await passwordForUrl(commanderUrl).catch(() => "");
         if (pw !== "" && (await v2PromptRemote(commanderUrl, pw, commanderId, inject))) {
-          return `handed back to ${commanderId} via:v2-http (req ${reqId} Re: ${inbound.reqId})`;
+          return `handed back to ${commanderId} via:v2-http (req ${reqId} Re: ${threadReqId})`;
         }
       } catch {
         // fall through to spool
@@ -210,6 +278,8 @@ export async function fleetHandoffBackHandler(
 
     // DIRECT first when the client can reach the commander live.
     if (client?.session?.promptAsync) {
+      const denied = await reverseGateOk();
+      if (denied) return denied;
       try {
         const body: Record<string, unknown> = {
           parts: [{ type: "text", text: inject }],
@@ -221,12 +291,12 @@ export async function fleetHandoffBackHandler(
         await client.session.promptAsync({ path: { id: commanderId }, body });
         try {
           await client?.app?.log?.({
-            body: { service: "fleet", level: "info", message: `fleet handoff ${reqId} Re:${inbound.reqId} direct → ${commanderId}` },
+            body: { service: "fleet", level: "info", message: `fleet handoff ${reqId} Re:${threadReqId} direct → ${commanderId}` },
           });
         } catch {
           // best-effort
         }
-        return `handed back to ${commanderId} via:direct (req ${reqId} Re: ${inbound.reqId})`;
+        return `handed back to ${commanderId} via:direct (req ${reqId} Re: ${threadReqId})`;
       } catch (err) {
         if (!isUnreachableError(err) && client?.session?.promptAsync) {
           // Non-unreachable direct errors (busy/timeout): still fall back to
@@ -250,7 +320,7 @@ export async function fleetHandoffBackHandler(
     } catch (err) {
       return `fleet_handoff_back failed: spool write failed: ${toReadableError(err)}`;
     }
-    return `handed back to ${commanderId} via:spool (req ${reqId} Re: ${inbound.reqId})`;
+    return `handed back to ${commanderId} via:spool (req ${reqId} Re: ${threadReqId})`;
   } catch (err) {
     return `fleet_handoff_back failed: ${toReadableError(err)}`;
   }
@@ -341,7 +411,7 @@ export async function fleetThreadHandler(
 export const fleetHandoffBackDef: ToolDef = {
   name: "fleet_handoff_back",
   description:
-    "Hand a delegation back to the commander that sent it (reverse delegation via direct promptAsync with spool fallback). Returns who it handed back to and via which path.",
+    "Hand a delegation back to the commander that sent it (routes to the CURRENT owner after transfers; survives .req cleanup via the durable handoff origin). Reverse delegation via direct promptAsync with spool fallback. Returns who it handed back to and via which path.",
   args: {
     message: z
       .string()

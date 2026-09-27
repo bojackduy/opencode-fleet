@@ -24,15 +24,42 @@ Or from npm once published:
 | Tool | What it does |
 | ---- | ------------ |
 | `fleet_register` | Register current session (daemon, directory, summary) |
-| `fleet_list` | List workers (24h TTL, excludes self by default) |
-| `fleet_discover` / `fleet_ps` | Discover live sessions + process/port join (v1 API first) |
-| `fleet_broadcast` | Fan out to all / `only:[...]` with `agent/model/variant`, waits for `.res.json` |
-| `fleet_exec` | Fast direct `promptAsync` + abort/retry, spool fallback |
-| `fleet_status` / `fleet_thread` | Compact status + `DONE:` extraction / thread view |
-| `fleet_handoff_back` | Worker hands corrected result back to commander (`Re:reqId`) |
+| `fleet_list` | List workers **you own** (per-commander scoped, 24h TTL, excludes self by default; `scope:"all"` for the explicit global roster) |
+| `fleet_discover` / `fleet_ps` | Discover live sessions + process/port join (v1 API first; ownership-annotated: owner / `unassigned` / `unknown`) |
+| `fleet_assign` / `fleet_unassign` / `fleet_transfer` | Claim a worker, release (one or all), transfer to another commander — exactly one owner per worker |
+| `fleet_my_workers` / `fleet_unassigned` | Your owned workers (incl. stale rows) / claimable workers with no owner |
+| `fleet_broadcast` | Fan out to **your owned workers** by default / `only:[...]` (each must be yours) with `agent/model/variant`, waits for `.res.json` |
+| `fleet_exec` | Fast direct `promptAsync` + abort/retry, spool fallback — gated to workers you own (`force` never bypasses ownership) |
+| `fleet_status` / `fleet_thread` | Compact status + `DONE:` extraction over your owned workers / thread view |
+| `fleet_watch` / `fleet_ack` | Watch **your own** assignment events (`join/leave/idle/done/role/transfer`); explicit ack advances the cursor |
+| `fleet_handoff_back` | Worker hands corrected result back to the **current** owner (`Re:reqId`; survives `.req` cleanup, transfer-aware) |
 | `fleet_agents` / `fleet_models` | List available agents / models |
-| `fleet_allow` / `fleet_block` / `fleet_policy` | Commander allowlist + `accept/hold/refuse` inbound policy |
-| `fleet_summary` / `fleet_group` | Grouped counts + last `DONE:` per group |
+| `fleet_allow` / `fleet_block` / `fleet_policy` | Commander allowlist + `commander-only/accept/hold/refuse` inbound policy |
+| `fleet_summary` / `fleet_group` | Grouped counts + last `DONE:` per group over workers you own |
+
+## Assignment workflow
+
+Multiple commanders share one fleet with **exactly one controlling commander
+per worker** (composite identity `runtime + daemonId + sessionId` — bare
+`ses_` ids that collide across v1/v2 must use the full selector):
+
+1. `fleet_discover` (or `fleet_unassigned`) → find a claimable worker.
+2. `fleet_assign` → claim it. A second commander's claim fails with
+   `owned-by-other`; only the owner can exec/broadcast/status it, transfer
+   it, or release it.
+3. `fleet_exec` / `fleet_broadcast` / `fleet_status` / `fleet_list` /
+   `fleet_summary` default to **your owned workers only**. Queued requests
+   carry a generation stamp that is revalidated at delivery: a transfer that
+   races the queue makes the old envelope stale (readable re-send error,
+   never orphan-delivered).
+4. `fleet_transfer` → hand a worker to another commander. In-flight
+   handoffs follow: `fleet_handoff_back` routes to the **current** owner via
+   a durable origin that survives `.req` cleanup.
+
+Every delegation still lands as a normal user message (`agent` / `model` /
+`variant` / `system` replay hints preserved), and the global inbound policy
+(`commander-only` default, `hold`, `refuse`) is enforced after ownership on
+both send and delivery.
 
 ## Protocol
 
@@ -73,7 +100,7 @@ Caveats:
 - Do **not** point a v2 `plugins` entry at a file path (`…/dist/index.js`
   is rejected — "must be a directory"). Use the package spec above, or an
   absolute directory that contains `server.*`/`index.*` at its root.
-- All 19 `fleet_*` tools register natively per location; identity is the
+- All 26 `fleet_*` tools register natively per location; identity is the
   calling `sessionID`. Delegation routes by the target row's `runtime`:
   same-process in-process prompt → remote v2 HTTP (`POST
   {url}/api/session/{id}/prompt`, password read from

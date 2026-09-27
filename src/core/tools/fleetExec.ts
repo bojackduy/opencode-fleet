@@ -24,10 +24,13 @@ import { buildInjectText, parseFleetModel } from "../inbox.js";
 import { atomicWriteJson, cleanupReq, readRes, writeReq } from "../fileTransport.js";
 import type { FleetEnvelope } from "../fileTransport.js";
 import { notifyPath } from "../notify.js";
-import { canExecDetail, denyText } from "../auth.js";
-import { listRegistry, runtimeOf } from "../registry.js";
+import { listRegistry, runtimeOf, fleetKeyOf } from "../registry.js";
 import type { RegistryEntry } from "../registry.js";
 import { passwordForUrl, pollV2Done, v2PromptRemote } from "../v2transport.js";
+import { doneNoteFor, emitOwnershipEvent } from "../ownershipEvents.js";
+import { gateSendToWorker, stampEnvelope, validateDelivery } from "../ownershipControl.js";
+import { originFromStamped, recordHandoffOriginStrict } from "../ownershipControl.js";
+import type { SessionSelector } from "../assignments.js";
 
 export interface FleetToolDeps {
   // biome-ignore lint/suspicious/noExplicitAny: v1 plugin client is untyped at the boundary.
@@ -133,6 +136,36 @@ function snippetOf(text: string, max = 200): string {
   return one.length <= max ? one : `${one.slice(0, max)}…`;
 }
 
+/**
+ * Persist the durable handoff origin for a DIRECT/in-process/HTTP accepted
+ * delegation (these paths never write a .req file, so the spool watcher
+ * cannot record it). Generation-guarded: concurrent older delegations never
+ * overwrite a newer origin. Returns a visible warning suffix when the stamp
+ * is missing or persistence fails — callers must surface it, never silently
+ * claim takeover works. Spool paths must NOT call this (the owning daemon's
+ * watcher records the origin at delivery; double writes are skipped there).
+ */
+async function persistAcceptedOrigin(envelope: FleetEnvelope): Promise<string | null> {
+  try {
+    const origin = originFromStamped(envelope);
+    if (!origin) {
+      return "WARNING: handoff origin not persisted (missing ownership stamp)";
+    }
+    try {
+      await recordHandoffOriginStrict(origin);
+      return null;
+    } catch (err) {
+      return `WARNING: handoff origin not persisted (${toReadableError(err)})`;
+    }
+  } catch (err) {
+    return `WARNING: handoff origin not persisted (${toReadableError(err)})`;
+  }
+}
+
+function withOriginWarning(text: string, warning: string | null): string {
+  return warning ? `${text} | ${warning}` : text;
+}
+
 function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.reject(new Error("aborted"));
   return new Promise((resolve, reject) => {
@@ -166,11 +199,26 @@ export async function fleetExecHandler(args: any, context: any, deps?: FleetTool
     const signal = context?.abort as AbortSignal | undefined;
     const force = args?.force === true;
 
-    // P5 auth gate (role matrix): hold queues, deny renders readable text.
-    const freshForAuth = await listRegistry({ includeSelf: true }).catch(() => []);
-    try {
-      const verdict = await canExecDetail(selfId, sessionId, freshForAuth, { force });
-      if (verdict.allowed === "hold") {
+    // Phase B2 exclusive-ownership send gate (context composite caller +
+    // composite target, ambiguity fails; force NEVER bypasses ownership).
+    // Target composite qualifiers accepted under both the fleet_assign-style
+    // (workerRuntime/workerDaemonId) and short (runtime/daemonId) names.
+    const rawRt = args?.workerRuntime ?? args?.runtime;
+    const rawDaemon = args?.workerDaemonId ?? args?.daemonId;
+    const sel: SessionSelector = { sessionId };
+    if (typeof rawRt === "string" && rawRt.trim() !== "") {
+      const rt = rawRt.trim();
+      if (rt !== "v1" && rt !== "v2") {
+        return `fleet_exec failed: runtime must be v1|v2 (got ${rawRt.trim()})`;
+      }
+      sel.runtime = rt;
+    }
+    if (typeof rawDaemon === "string" && rawDaemon.trim() !== "") {
+      sel.daemonId = rawDaemon.trim();
+    }
+    const gate = await gateSendToWorker(context as any, deps?.rt, sel, { force });
+    if (!gate.ok) {
+      if (gate.held) {
         const reqId = `exec-${Date.now()}-${randomSuffix()}`;
         const heldEnvelope = {
           reqId,
@@ -196,34 +244,33 @@ export async function fleetExecHandler(args: any, context: any, deps?: FleetTool
         }
         return `${sessionId} | held for approval, use fleet_allow`;
       }
-      if (verdict.allowed === false) {
-        return `fleet_exec ${denyText(verdict.reason)}`;
-      }
-    } catch {
-      // auth never blocks on its own failure — fall through to exec.
+      return `fleet_exec failed: ${gate.error}`;
     }
 
     const fresh = await listRegistry({ includeSelf: true });
-    const entry = fresh.find((e) => e.sessionId === sessionId);
+    const entry = fresh.find((e) => fleetKeyOf(e) === gate.workerKey);
     if (!entry) {
       return `fleet_exec failed: ${sessionId} not in registry (suggest fleet_discover to find live sessions)`;
     }
 
     const reqId = `exec-${Date.now()}-${randomSuffix()}`;
     const modelRaw = (args as any)?.model as FleetEnvelope["model"];
-    const envelope: FleetEnvelope = {
-      reqId,
-      fromCommander: selfId,
-      targetSessionId: sessionId,
-      targetDaemonId: entry.daemonId,
-      message,
-      createdAt: Date.now(),
-      hop: 0,
-      ...(typeof args?.agent === "string" && args.agent !== "" ? { agent: args.agent } : {}),
-      ...(modelRaw !== undefined && modelRaw !== null && modelRaw !== "" ? { model: modelRaw } : {}),
-      ...(typeof args?.variant === "string" && args.variant !== "" ? { variant: args.variant } : {}),
-      ...(typeof args?.system === "string" && args.system !== "" ? { system: args.system } : {}),
-    };
+    const envelope: FleetEnvelope = stampEnvelope(
+      {
+        reqId,
+        fromCommander: selfId,
+        targetSessionId: sessionId,
+        targetDaemonId: gate.targetDaemonId,
+        message,
+        createdAt: Date.now(),
+        hop: 0,
+        ...(typeof args?.agent === "string" && args.agent !== "" ? { agent: args.agent } : {}),
+        ...(modelRaw !== undefined && modelRaw !== null && modelRaw !== "" ? { model: modelRaw } : {}),
+        ...(typeof args?.variant === "string" && args.variant !== "" ? { variant: args.variant } : {}),
+        ...(typeof args?.system === "string" && args.system !== "" ? { system: args.system } : {}),
+      },
+      gate,
+    );
     const inject = buildInjectText(envelope);
     const parsedModel = parseFleetModel(envelope.model);
 
@@ -234,7 +281,7 @@ export async function fleetExecHandler(args: any, context: any, deps?: FleetTool
     }
 
     if (mode === "direct") {
-      const direct = await tryDirect(client, sessionId, inject, envelope, timeoutMs, abortOnBusy, signal);
+      const direct = await tryDirect(client, sessionId, inject, envelope, timeoutMs, abortOnBusy, signal, entry);
       if (direct.ok) return direct.text;
       // Fall through to spool only when direct looks like an asleep-daemon
       // failure. Busy/timeout/abort stays a direct error (no spool point:
@@ -242,7 +289,7 @@ export async function fleetExecHandler(args: any, context: any, deps?: FleetTool
       if (!direct.fallbackToSpool) return direct.text;
     }
 
-    return await spoolFallback(sessionId, envelope, timeoutMs, signal);
+    return await spoolFallback(sessionId, envelope, timeoutMs, signal, entry);
   } catch (err) {
     return `fleet_exec failed: ${toReadableError(err)}`;
   }
@@ -269,6 +316,8 @@ async function execToV2(
   const rt = deps?.rt;
   // 1. Same v2 process.
   if (rt?.kind === "v2" && rt.daemonId === entry.daemonId) {
+    const denied = await revalidateForward(sessionId, envelope, entry);
+    if (denied) return `${sessionId} | via:in-process | error: ${denied.slice(`${sessionId} | error: `.length)}`;
     const since = Date.now();
     try {
       await rt.promptLocal(sessionId, inject, {
@@ -278,23 +327,32 @@ async function execToV2(
         ...(envelope.system ? { system: envelope.system } : {}),
       });
     } catch {
-      return await spoolFallback(sessionId, envelope, timeoutMs, signal);
+      return await spoolFallback(sessionId, envelope, timeoutMs, signal, entry);
     }
+    // Accepted by the target runtime: persist the durable handoff origin
+    // NOW (before the DONE poll) so timeouts/no-poll still leave takeover
+    // working. Never spool after this (would double-deliver).
+    const originWarning = await persistAcceptedOrigin(envelope);
     let reply: string | null = null;
     try {
       reply = (await rt.waitForDone?.(sessionId, since, timeoutMs, signal)) ?? null;
     } catch {
       reply = null;
     }
-    if (signal?.aborted) return `${sessionId} | via:in-process | error: aborted`;
+    if (signal?.aborted) return withOriginWarning(`${sessionId} | via:in-process | error: aborted`, originWarning);
     if (reply === null) {
-      return `${sessionId} | via:in-process | ok | injected; DONE poll unavailable (no service credentials)`;
+      return withOriginWarning(`${sessionId} | via:in-process | ok | injected; DONE poll unavailable (no service credentials)`, originWarning);
     }
     const done = doneLineOf(reply);
     if (done === null || done.trim() === "") {
-      return `${sessionId} | via:in-process | error: no trailing DONE: line found`;
+      return withOriginWarning(`${sessionId} | via:in-process | error: no trailing DONE: line found`, originWarning);
     }
-    return `${sessionId} | via:in-process | ok | DONE:${done.trim()} | ${snippetOf(reply)}`;
+    try {
+      await emitOwnershipEvent(fleetKeyOf(entry), "done", doneNoteFor(done.trim())).catch(() => null);
+    } catch {
+      // scoped notify is best-effort
+    }
+    return withOriginWarning(`${sessionId} | via:in-process | ok | DONE:${done.trim()} | ${snippetOf(reply)}`, originWarning);
   }
   // 2. Remote v2 service (endpoint url, else the v2: daemonId suffix).
   const url =
@@ -306,25 +364,35 @@ async function execToV2(
   if (url !== "" && !url.startsWith("pid:")) {
     const pw = await passwordForUrl(url).catch(() => "");
     if (pw !== "") {
+      const denied = await revalidateForward(sessionId, envelope, entry);
+      if (denied) return `${sessionId} | via:v2-http | error: ${denied.slice(`${sessionId} | error: `.length)}`;
       const since = Date.now();
       const accepted = await v2PromptRemote(url, pw, sessionId, inject);
       if (accepted) {
+        // Accepted remotely: persist origin before polling so timeouts still
+        // leave takeover working. Never spool after this (double-delivery).
+        const originWarning = await persistAcceptedOrigin(envelope);
         const reply = await pollV2Done(url, pw, sessionId, since, timeoutMs, signal);
         if (reply === null) {
-          if (signal?.aborted) return `${sessionId} | via:v2-http | error: aborted`;
-          return `${sessionId} | via:v2-http | error: timeout after ${timeoutMs}ms waiting for DONE: reply`;
+          if (signal?.aborted) return withOriginWarning(`${sessionId} | via:v2-http | error: aborted`, originWarning);
+          return withOriginWarning(`${sessionId} | via:v2-http | error: timeout after ${timeoutMs}ms waiting for DONE: reply`, originWarning);
         }
         const done = doneLineOf(reply);
         if (done === null || done.trim() === "") {
-          return `${sessionId} | via:v2-http | error: no trailing DONE: line found`;
+          return withOriginWarning(`${sessionId} | via:v2-http | error: no trailing DONE: line found`, originWarning);
         }
-        return `${sessionId} | via:v2-http | ok | DONE:${done.trim()} | ${snippetOf(reply)}`;
+        try {
+          await emitOwnershipEvent(fleetKeyOf(entry), "done", doneNoteFor(done.trim())).catch(() => null);
+        } catch {
+          // scoped notify is best-effort
+        }
+        return withOriginWarning(`${sessionId} | via:v2-http | ok | DONE:${done.trim()} | ${snippetOf(reply)}`, originWarning);
       }
       // Prompt rejected (unknown session/standalone) → spool fallback below.
     }
   }
   // 3. Spool (v2 commander→v1 worker and v1 commander→v2 worker also land here).
-  return await spoolFallback(sessionId, envelope, timeoutMs, signal);
+  return await spoolFallback(sessionId, envelope, timeoutMs, signal, entry);
 }
 
 async function tryDirect(
@@ -335,6 +403,7 @@ async function tryDirect(
   timeoutMs: number,
   abortOnBusy: boolean,
   signal?: AbortSignal,
+  entry?: RegistryEntry,
 ): Promise<{ ok: boolean; text: string; fallbackToSpool: boolean }> {
   const fail = (text: string, fallbackToSpool: boolean) => ({ ok: false as const, text, fallbackToSpool });
   try {
@@ -352,6 +421,10 @@ async function tryDirect(
     if (envelope.variant) body["variant"] = envelope.variant;
     if (envelope.system) body["system"] = envelope.system;
     // NOTE: never set noReply — delegation must land as a normal user bubble.
+    const denied = await revalidateForward(sessionId, envelope, entry);
+    if (denied) {
+      return fail(denied, false);
+    }
     const beforeTime = Date.now();
     try {
       await client.session.promptAsync({ path: { id: sessionId }, body });
@@ -387,19 +460,42 @@ async function tryDirect(
       }
     }
     const reply = await pollDirectReply(client, sessionId, beforeTime, timeoutMs, signal);
+    // The prompt was ACCEPTED by the target runtime (promptAsync resolved):
+    // persist the durable handoff origin now so a later manual takeover can
+    // fleet_handoff_back even though no .req file exists. Generation-guarded
+    // (concurrent older delegations never overwrite newer). Persistence
+    // failure is surfaced visibly, never silent. Never spool after this
+    // (would double-deliver) — timeouts stay direct errors with the warning.
+    const originWarning = await persistAcceptedOrigin(envelope);
     if (reply === null) {
       return fail(
-        `${sessionId} | via:direct | error: timeout after ${timeoutMs}ms waiting for DONE: reply`,
+        withOriginWarning(
+          `${sessionId} | via:direct | error: timeout after ${timeoutMs}ms waiting for DONE: reply`,
+          originWarning,
+        ),
         false,
       );
     }
     const done = doneLineOf(reply);
     if (done === null || done.trim() === "") {
-      return fail(`${sessionId} | via:direct | error: no trailing DONE: line found`, false);
+      return fail(
+        withOriginWarning(`${sessionId} | via:direct | error: no trailing DONE: line found`, originWarning),
+        false,
+      );
+    }
+    // Phase B1: scoped DONE to the assigned commander only (snippet).
+    try {
+      const key = entry ? fleetKeyOf(entry) : null;
+      if (key) await emitOwnershipEvent(key, "done", doneNoteFor(done.trim())).catch(() => null);
+    } catch {
+      // scoped notify is best-effort
     }
     return {
       ok: true,
-      text: `${sessionId} | via:direct | ok | DONE:${done.trim()} | ${snippetOf(reply)}`,
+      text: withOriginWarning(
+        `${sessionId} | via:direct | ok | DONE:${done.trim()} | ${snippetOf(reply)}`,
+        originWarning,
+      ),
       fallbackToSpool: false,
     };
   } catch (err) {
@@ -415,6 +511,32 @@ async function tryDirect(
 
 function parsedModelOf(envelope: FleetEnvelope) {
   return parseFleetModel(envelope.model);
+}
+
+/**
+ * Revalidate the stamped envelope immediately before a live prompt
+ * (direct / in-process / HTTP). The send-time gate ran earlier; a
+ * transfer/unassign racing the prompt must deny here instead of injecting
+ * into a worker the caller no longer owns. Narrow unavoidable TOCTOU: once
+ * the target runtime ACCEPTS the prompt, the injected user bubble cannot be
+ * recalled — only queued (spool/held) requests are reliably rejected after
+ * the move. Never throws (denials render as readable text).
+ */
+async function revalidateForward(
+  sessionId: string,
+  envelope: FleetEnvelope,
+  entry: RegistryEntry | undefined,
+): Promise<string | null> {
+  try {
+    if (!entry) return `${sessionId} | error: target left the registry before injection; refusing (fail-closed)`;
+    const verdict = await validateDelivery(envelope, {
+      receiver: { runtime: runtimeOf(entry), daemonId: entry.daemonId, sessionId },
+    });
+    if (!verdict.ok) return `${sessionId} | error: ${verdict.error}`;
+    return null;
+  } catch {
+    return `${sessionId} | error: revalidation failed; refusing (fail-closed)`;
+  }
 }
 
 async function pollDirectReply(
@@ -455,7 +577,10 @@ async function spoolFallback(
   envelope: FleetEnvelope,
   timeoutMs: number,
   signal?: AbortSignal,
+  entry?: RegistryEntry,
 ): Promise<string> {
+  // NOTE: no handoff-origin write here — the owning daemon's spool watcher
+  // records the origin at delivery time (single writer; avoids duplicates).
   try {
     await writeReq(envelope.reqId, envelope);
   } catch (err) {
@@ -471,6 +596,15 @@ async function spoolFallback(
       const done = doneLineOf(reply);
       if (done === null || done.trim() === "") {
         return `${sessionId} | via:spool | error: no trailing DONE: line found (req ${envelope.reqId})`;
+      }
+      // Phase B1: scoped DONE to the assigned commander only (snippet).
+      // The inbox watcher emits the same event; journal dedup suppresses
+      // the duplicate delivery.
+      try {
+        const key = entry ? fleetKeyOf(entry) : null;
+        if (key) await emitOwnershipEvent(key, "done", doneNoteFor(done.trim())).catch(() => null);
+      } catch {
+        // scoped notify is best-effort
       }
       return `${sessionId} | via:spool | ok | DONE:${done.trim()} | ${snippetOf(reply)}`;
     }
@@ -488,9 +622,9 @@ async function spoolFallback(
 export const fleetExecDef: ToolDef = {
   name: "fleet_exec",
   description:
-    "Execute a self-contained task on one fleet worker fast via direct promptAsync, falling back to file-spool when the owning daemon is asleep. Returns sessionId | via | ok | DONE line | snippet.",
+    "Execute a self-contained task on one fleet worker you own (exclusive ownership gated; bare sessionId only when unambiguous, else pass the composite selector). Fast direct promptAsync, falling back to file-spool when the owning daemon is asleep. Returns sessionId | via | ok | DONE line | snippet.",
   args: {
-    sessionId: z.string().describe("Target worker session id (must be in registry)"),
+    sessionId: z.string().describe("Target worker session id (must be owned by you)"),
     message: z
       .string()
       .describe("Self-contained task (goal + files + constraints + done criteria)"),
@@ -522,7 +656,23 @@ export const fleetExecDef: ToolDef = {
     force: z
       .boolean()
       .optional()
-      .describe("Override commander->commander deny (default false)"),
+      .describe("Override commander->commander deny (default false; never bypasses worker ownership)"),
+    runtime: z
+      .string()
+      .optional()
+      .describe("Disambiguate colliding ids: v1|v2 (use with daemonId)"),
+    daemonId: z
+      .string()
+      .optional()
+      .describe("Disambiguate colliding ids: owning daemon id (use with runtime)"),
+    workerRuntime: z
+      .string()
+      .optional()
+      .describe("Alias of runtime: disambiguate colliding worker ids (v1|v2)"),
+    workerDaemonId: z
+      .string()
+      .optional()
+      .describe("Alias of daemonId: owning daemon id of the worker"),
   },
   run: (args, callCtx, rt) => fleetExecHandler(args, callCtx, depsOf(rt)),
 };

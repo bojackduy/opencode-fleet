@@ -30,6 +30,19 @@ export interface FleetEnvelope {
   targetSessionId: string;
   /** Owning daemon; InboxWatcher only picks up reqs for its own daemonId. */
   targetDaemonId?: string;
+  /** Phase B2 ownership proof (composite fleet keys + CAS generation). */
+  workerKey?: string;
+  commanderKey?: string;
+  generation?: number;
+  /**
+   * Envelope purpose. "handoff" = worker->commander reverse delegation
+   * (validated by the reverse gate, never by the worker-delivery gate).
+   * Absent reads as "exec" (commander->worker forward delegation) for
+   * backward compatibility with pre-kind spool files.
+   */
+  kind?: "exec" | "handoff";
+  /** Handoff audit: the inbound thread this reverse delegation answers. */
+  originReqId?: string;
   /** Self-contained task text (includes DONE: instruction). */
   message: string;
   /** Optional replay hints for prompt_async (used in Phase 2). */

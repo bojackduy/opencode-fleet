@@ -1,20 +1,28 @@
 /**
- * fleetList.ts — Phase 3 `fleet_list` tool.
+ * fleetList.ts — Phase 3 `fleet_list` tool, Phase B2 per-commander scoped.
  *
- * Reads the registry via `listRegistry()` (24h TTL filtering is already
- * applied there) and renders a compact table. Never throws — failures are
- * returned as readable text.
+ * Exactly ONE controlling commander per worker (see ../assignments.ts).
+ * Default rows are ONLY the calling commander's owned workers (never the
+ * whole fleet, never another commander's workers — no accidental foreign
+ * visibility). Pass scope:"all" for an explicit global roster. Caller
+ * identity ALWAYS comes from the tool context + runtime (fail-closed:
+ * unknown/non-commander callers and unreadable state render readable
+ * errors, never a misleading list). Never throws.
  */
 
 import { depsOf, z } from "../toolDef.js";
 import type { ToolDef } from "../toolDef.js";
-import { listRegistry } from "../registry.js";
+import type { Runtime } from "../runtime.js";
+import { listRegistry, fleetKeyOf } from "../registry.js";
+import type { RegistryEntry } from "../registry.js";
+import { scopedRegistryEntries } from "../ownershipControl.js";
 import { renderTree } from "./fleetRoles.js";
 
 export interface FleetToolDeps {
   // biome-ignore lint/suspicious/noExplicitAny: v1 plugin client is untyped at the boundary.
   client?: any;
   serverUrl?: string | URL;
+  rt?: Runtime;
 }
 
 function toReadableError(err: unknown): string {
@@ -30,14 +38,30 @@ function toReadableError(err: unknown): string {
 export async function fleetListHandler(
   args: any,
   context: any,
-  _deps?: FleetToolDeps,
+  deps?: FleetToolDeps,
 ): Promise<string> {
-  void _deps;
   try {
     const includeSelf = args?.includeSelf === true;
     const selfId = context?.sessionID ?? context?.sessionId;
-    const entries = await listRegistry({ includeSelf, selfId });
-    if (entries.length === 0) return "no workers registered";
+    const scopeAll = typeof args?.scope === "string" && args.scope.trim().toLowerCase() === "all";
+    const scoped = await scopedRegistryEntries(context as any, deps?.rt);
+    if (!scoped.ok) return `fleet_list failed: ${scoped.error}`;
+    let entries: RegistryEntry[];
+    if (scopeAll) {
+      entries = await listRegistry({ includeSelf, selfId });
+    } else {
+      entries = [...scoped.owned];
+      if (includeSelf) {
+        const all = await listRegistry({ includeSelf: true, selfId });
+        const self = all.find((e) => fleetKeyOf(e) === scoped.callerKey);
+        if (self && !entries.some((e) => fleetKeyOf(e) === scoped.callerKey)) entries.push(self);
+      }
+    }
+    if (entries.length === 0) {
+      return scopeAll
+        ? "no workers registered"
+        : `no workers assigned to you (claim workers with fleet_assign; unassigned discovery: fleet_unassigned)`;
+    }
     // P5 hierarchy view: group by parentID (commanders top, workers nested).
     if (args?.tree === true) return renderTree(entries, selfId);
     const now = Date.now();
@@ -57,12 +81,16 @@ export async function fleetListHandler(
 export const fleetListDef: ToolDef = {
   name: "fleet_list",
   description:
-    "List registered fleet worker sessions (entries older than 24h are hidden). Excludes self unless includeSelf is true.",
+    "List fleet workers you own (per-commander scoped; entries older than 24h are hidden). Pass scope:\"all\" for an explicit global roster. Excludes self unless includeSelf is true.",
   args: {
     includeSelf: z
       .boolean()
       .optional()
       .describe("Include the calling session in the list"),
+    scope: z
+      .string()
+      .optional()
+      .describe('Row scope: default is your owned workers only; "all" for the explicit global roster'),
     tree: z
       .boolean()
       .optional()

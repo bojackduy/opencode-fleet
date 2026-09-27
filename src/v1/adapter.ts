@@ -42,6 +42,20 @@ import { readRegistry, registerSelf, removeSession, ensureStateMigrated } from "
 import { runtimeOf } from "../core/registry.js";
 import { beat } from "../core/heartbeat.js";
 import { writeNotify, writeRosterNotify } from "../core/notify.js";
+import {
+  doneNoteFor,
+  emitForWorkerIdentity,
+  emitOwnershipEvent,
+  emitToOwnersOfSession,
+  idleNoteFor,
+  snapshotOwnersForSession,
+} from "../core/ownershipEvents.js";
+import {
+  recordHandoffOrigin,
+  shortSessionOf,
+  validateDelivery,
+  validateHandoffDelivery,
+} from "../core/ownershipControl.js";
 import { ALL_TOOL_DEFS } from "../core/tools/index.js";
 import type { ToolDef } from "../core/toolDef.js";
 import type { CallCtx, LogLevel, Runtime } from "../core/runtime.js";
@@ -195,6 +209,56 @@ function startDaemonWatcher(
         log(`fleet req ${reqId}: ${text}`);
         return;
       }
+      // Phase B2 delivery-time revalidation (TOCTOU-safe): envelopes are
+      // dispatched by explicit kind — forward (commander->worker) envelopes
+      // bind the ownership stamp to the ACTUAL receiving session (stamped
+      // workerKey must equal this session's composite; forged targets and
+      // legacy unstamped envelopes rejected), while handoff (worker->
+      // commander reverse) envelopes run the reverse gate (sender binding +
+      // durable origin + current-owner check). A transfer/unassign racing a
+      // queued request makes it STALE -> rejected with a readable error,
+      // never orphan-delivered.
+      if (envelope.kind === "handoff") {
+        const verdict = await validateHandoffDelivery(envelope, {
+          receiver: { runtime: "v1", daemonId, sessionId: targetSessionId },
+        });
+        if (!verdict.ok) {
+          try {
+            await writeRes(reqId, { ok: false, error: verdict.error });
+          } catch {
+            // writeRes failing must not crash the watcher.
+          }
+          log(`fleet req ${reqId}: ${verdict.error}`);
+          return;
+        }
+      } else {
+        const verdict = await validateDelivery(envelope, {
+          receiver: { runtime: "v1", daemonId, sessionId: targetSessionId },
+        });
+        if (!verdict.ok) {
+          try {
+            await writeRes(reqId, { ok: false, error: verdict.error });
+          } catch {
+            // writeRes failing must not crash the watcher.
+          }
+          log(`fleet req ${reqId}: ${verdict.error}`);
+          return;
+        }
+        // Worker-side delivery: persist the delegating origin (durable
+        // handoff routing survives commander-side .req cleanup).
+        try {
+          await recordHandoffOrigin({
+            workerKey: verdict.workerKey,
+            fromCommanderKey: verdict.commanderKey,
+            fromCommanderSession: shortSessionOf(verdict.commanderKey),
+            reqId,
+            generation: verdict.generation,
+            at: Date.now(),
+          });
+        } catch {
+          // origin persistence is best-effort
+        }
+      }
       await writeFile(claimedPath(reqId), daemonId, { mode: 0o600 }).catch(
         () => undefined,
       );
@@ -239,6 +303,19 @@ function startDaemonWatcher(
         await writeNotify(reqId, envelope, reply.trim());
       } catch {
         // notify is best-effort; never break the inbox path.
+      }
+      // Phase B1: scoped DONE to the assigned commander only (snippet, no
+      // raw prompts). Unassigned workers produce no scoped event. Dedup
+      // suppresses a second delivery when fleet_exec already emitted it.
+      try {
+        const done = doneLineOf(reply.trim());
+        await emitForWorkerIdentity(
+          { runtime: "v1", daemonId, sessionId: targetSessionId },
+          "done",
+          doneNoteFor(done !== null && done.trim() !== "" ? done : reply.trim()),
+        );
+      } catch {
+        // scoped notify is best-effort
       }
       log(`fleet req ${reqId}: DONE:${done}`);
     } catch (err) {
@@ -462,10 +539,19 @@ export async function server(input: PluginInput) {
   const handle = { watcher, daemonId, serverUrl: serverUrlStr };
 
   // P4 heartbeat helper: beat() via the v1 API only, then registerSelf
-  // with the enriched entry (title/agent/model/status/lastDone). Never throws.
-  const heartbeatAndRegister = async (sessionID: string): Promise<void> => {
+  // with the enriched entry (title/agent/model/status/lastDone). Returns the
+  // heartbeat (or null) so event hooks can route scoped ownership events.
+  // Never throws.
+  const heartbeatAndRegister = async (sessionID: string): Promise<null | {
+    sessionId: string;
+    daemonId: string;
+    status: string;
+    lastDone: string;
+    role: string;
+    parentID: string;
+  }> => {
     try {
-      if (sessionID === "") return;
+      if (sessionID === "") return null;
       const hb = await beat({
         client,
         sessionID,
@@ -487,6 +573,7 @@ export async function server(input: PluginInput) {
           ...(hb.parentID !== "" ? { parentID: hb.parentID } : {}),
           updatedAt: hb.updatedAt,
         });
+        return hb;
       } else {
         await registerSelf({
           sessionId: sessionID,
@@ -494,14 +581,48 @@ export async function server(input: PluginInput) {
           directory: String(input.directory ?? ""),
           runtime: "v1",
         });
+        return null;
+      }
+    } catch {
+      // best-effort only
+      return null;
+    }
+  };
+
+  // P6 periodic re-beat (daemon-wide ~60s, own v1 rows only). The wrapper
+  // also refreshes scoped ownership events (idle/role, dedup-suppressed).
+  const rebeat = startPeriodicRebeat(client, serverUrlStr, daemonId, async (sessionId: string) => {
+    try {
+      const before = await readRegistry().catch(() => []);
+      const oldRow = before.find((x) => x.sessionId === sessionId);
+      const hb = await heartbeatAndRegister(sessionId);
+      void hb;
+      try {
+        const after = await readRegistry().catch(() => []);
+        const row = after.find((x) => x.sessionId === sessionId);
+        if (row) {
+          await emitForWorkerIdentity(
+            { runtime: "v1", daemonId: row.daemonId, sessionId },
+            "idle",
+            idleNoteFor(String((row as { lastDone?: unknown }).lastDone ?? "")),
+          ).catch(() => null);
+          const oldRole = String((oldRow as { role?: unknown } | undefined)?.role ?? "");
+          const newRole = String((row as { role?: unknown }).role ?? "");
+          if (oldRole !== "" && newRole !== "" && oldRole !== newRole) {
+            await emitForWorkerIdentity(
+              { runtime: "v1", daemonId: row.daemonId, sessionId },
+              "role",
+              `${oldRole}->${newRole}`,
+            ).catch(() => null);
+          }
+        }
+      } catch {
+        // scoped notify is best-effort
       }
     } catch {
       // best-effort only
     }
-  };
-
-  // P6 periodic re-beat (daemon-wide ~60s, own v1 rows only).
-  const rebeat = startPeriodicRebeat(client, serverUrlStr, daemonId, heartbeatAndRegister, (m) => {
+  }, (m) => {
     void appLog(m).catch(() => undefined);
   });
 
@@ -534,6 +655,8 @@ export async function server(input: PluginInput) {
         const sessionId = typeof rawId === "string" ? rawId : "";
         if (type === "session.created") {
           // Auto-register new sessions via heartbeat (v1 daemons only).
+          // Global roster join stays for discovery; scoped join goes only
+          // to the assigned commander (silent when unassigned).
           if (sessionId !== "" && isV1Daemon(serverUrlStr)) {
             await heartbeatAndRegister(sessionId);
             try {
@@ -547,11 +670,35 @@ export async function server(input: PluginInput) {
             } catch {
               // roster notify is best-effort
             }
+            try {
+              const entries = await readRegistry().catch(() => []);
+              const row = entries.find((x) => x.sessionId === sessionId);
+              if (row) {
+                await emitForWorkerIdentity(
+                  { runtime: "v1", daemonId: row.daemonId, sessionId },
+                  "join",
+                  String(row?.title ?? row?.summary ?? sessionId).slice(0, 200),
+                ).catch(() => null);
+              } else {
+                await emitToOwnersOfSession(sessionId, "join", sessionId).catch(() => null);
+              }
+            } catch {
+              // scoped notify is best-effort
+            }
           }
           return;
         }
         if (type === "session.deleted") {
           if (sessionId !== "") {
+            // Snapshot the owner BEFORE removeSession so the scoped leave
+            // route survives registry removal (assignment rows persist).
+            let snap: { workerKey: string; commanderKey: string }[] = [];
+            try {
+              const s = await snapshotOwnersForSession(sessionId);
+              if (!("error" in s)) snap = s.owners;
+            } catch {
+              snap = [];
+            }
             try {
               await removeSession(sessionId);
             } catch {
@@ -562,20 +709,73 @@ export async function server(input: PluginInput) {
             } catch {
               // roster notify is best-effort
             }
+            try {
+              for (const o of snap) {
+                await emitOwnershipEvent(o.workerKey, "leave", sessionId).catch(() => null);
+              }
+              if (snap.length === 0) {
+                await emitToOwnersOfSession(sessionId, "leave", sessionId).catch(() => null);
+              }
+            } catch {
+              // scoped notify is best-effort
+            }
           }
           return;
         }
         if (type === "session.idle") {
-          // Heartbeat via the v1 API: refresh title/agent/model/status/lastDone.
+          // Heartbeat via the v1 API: refresh title/agent/model/status/lastDone,
+          // then route a scoped idle (+role on change) to the owner only.
+          // Manual idle included; dedup suppresses repeat transitions.
           if (sessionId === "") return;
           try {
             const entries = await readRegistry();
             const self = entries.find((x) => x.sessionId === sessionId);
+            const oldRole = String((self as { role?: unknown } | undefined)?.role ?? "");
+            const oldDone = String((self as { lastDone?: unknown } | undefined)?.lastDone ?? "");
             if (!self) {
               await heartbeatAndRegister(sessionId);
+              try {
+                const after = await readRegistry().catch(() => []);
+                const row = after.find((x) => x.sessionId === sessionId);
+                if (row) {
+                  await emitForWorkerIdentity(
+                    { runtime: "v1", daemonId: row.daemonId, sessionId },
+                    "idle",
+                    idleNoteFor(String((row as { lastDone?: unknown }).lastDone ?? "")),
+                  ).catch(() => null);
+                }
+              } catch {
+                // scoped notify is best-effort
+              }
               return;
             }
             await heartbeatAndRegister(sessionId);
+            try {
+              const after = await readRegistry().catch(() => []);
+              const row = after.find((x) => x.sessionId === sessionId);
+              if (row) {
+                const newDone = String((row as { lastDone?: unknown }).lastDone ?? "");
+                // Suppress duplicate idle on the same transition (same lastDone
+                // as before the beat): the journal dedup is the second net.
+                if (newDone !== oldDone || oldDone === "") {
+                  await emitForWorkerIdentity(
+                    { runtime: "v1", daemonId: row.daemonId, sessionId },
+                    "idle",
+                    idleNoteFor(newDone),
+                  ).catch(() => null);
+                }
+                const newRole = String((row as { role?: unknown }).role ?? "");
+                if (oldRole !== "" && newRole !== "" && oldRole !== newRole) {
+                  await emitForWorkerIdentity(
+                    { runtime: "v1", daemonId: row.daemonId, sessionId },
+                    "role",
+                    `${oldRole}->${newRole}`,
+                  ).catch(() => null);
+                }
+              }
+            } catch {
+              // scoped notify is best-effort
+            }
           } catch {
             // best-effort
           }
