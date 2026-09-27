@@ -10,7 +10,7 @@
 
 import { depsOf, z } from "../toolDef.js";
 import type { ToolDef } from "../toolDef.js";
-import { listRegistry } from "../registry.js";
+import { listRegistry, runtimeOf } from "../registry.js";
 import type { RegistryEntry } from "../registry.js";
 import { claimCommander, releaseCommander, roleOf } from "../roles.js";
 
@@ -84,7 +84,7 @@ export function renderTree(entries: RegistryEntry[], selfId?: string): string {
       return 2;
     };
     tops.sort((a, b) => rank(a) - rank(b) || a.sessionId.localeCompare(b.sessionId));
-    const lines: string[] = ["role sessionId | daemonId | directory | summary"];
+    const lines: string[] = ["role sessionId | runtime | daemonId | directory | summary"];
     const seen = new Set<string>();
     const emit = (e: RegistryEntry, depth: number): void => {
       if (seen.has(e.sessionId)) return;
@@ -92,7 +92,7 @@ export function renderTree(entries: RegistryEntry[], selfId?: string): string {
       const pad = "  ".repeat(Math.min(depth, 8));
       const self = selfId !== undefined && selfId !== "" && e.sessionId === selfId ? " (self)" : "";
       lines.push(
-        `${pad}${roleOf(e)} ${e.sessionId}${self} | ${e.daemonId} | ${e.directory} | ${labelOf(e)}`,
+        `${pad}${roleOf(e)} ${e.sessionId}${self} | ${runtimeOf(e)} | ${e.daemonId} | ${e.directory} | ${labelOf(e)}`,
       );
       const children = (kids.get(e.sessionId) ?? [])
         .slice()
@@ -111,7 +111,7 @@ export function renderTree(entries: RegistryEntry[], selfId?: string): string {
         if (seen.has(o.sessionId)) continue;
         seen.add(o.sessionId);
         lines.push(
-          `  ${roleOf(o)} ${o.sessionId} | ${o.daemonId} | ${o.directory} | ${labelOf(o)} | parent=${parentOf(o)}`,
+          `  ${roleOf(o)} ${o.sessionId} | ${runtimeOf(o)} | ${o.daemonId} | ${o.directory} | ${labelOf(o)} | parent=${parentOf(o)}`,
         );
       }
     }

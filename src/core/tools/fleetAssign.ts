@@ -16,7 +16,7 @@
 import { depsOf, z } from "../toolDef.js";
 import type { ToolDef } from "../toolDef.js";
 import type { CallCtx, Runtime } from "../runtime.js";
-import { fleetKeyOf } from "../registry.js";
+import { fleetKeyOf, runtimeOf } from "../registry.js";
 import { getDaemonId } from "../inbox.js";
 import { withV1Marker } from "../v1.js";
 import { roleOf } from "../roles.js";
@@ -262,7 +262,7 @@ export async function fleetMyWorkersHandler(
     const lines = [`workers of ${caller.sessionId} (generation ${r.generation}):`];
     for (const w of r.owned) {
       lines.push(
-        `${w.entry.sessionId} | ${w.entry.daemonId} | ${w.entry.directory} | ${labelOf(w.entry)} | gen ${w.assignment.generation}`,
+        `${w.entry.sessionId} | ${runtimeOf(w.entry)} | ${w.entry.daemonId} | ${w.entry.directory} | ${labelOf(w.entry)} | gen ${w.assignment.generation}`,
       );
     }
     if (r.stale.length > 0) {
@@ -290,7 +290,7 @@ export async function fleetUnassignedHandler(
     const lines = [`unassigned workers (generation ${r.generation}):`];
     for (const e of r.workers) {
       lines.push(
-        `${e.sessionId} | ${e.daemonId} | ${e.directory} | ${roleOf(e)} | ${labelOf(e)}`,
+        `${e.sessionId} | ${runtimeOf(e)} | ${e.daemonId} | ${e.directory} | ${roleOf(e)} | ${labelOf(e)}`,
       );
     }
     return lines.join("\n");

@@ -13,7 +13,7 @@
 import { depsOf, z } from "../toolDef.js";
 import type { ToolDef } from "../toolDef.js";
 import type { Runtime } from "../runtime.js";
-import { listRegistry, fleetKeyOf } from "../registry.js";
+import { listRegistry, fleetKeyOf, runtimeOf } from "../registry.js";
 import type { RegistryEntry } from "../registry.js";
 import { scopedRegistryEntries } from "../ownershipControl.js";
 import { renderTree } from "./fleetRoles.js";
@@ -65,12 +65,12 @@ export async function fleetListHandler(
     // P5 hierarchy view: group by parentID (commanders top, workers nested).
     if (args?.tree === true) return renderTree(entries, selfId);
     const now = Date.now();
-    const lines = ["sessionId | daemonId | directory | summary | ageH"];
+    const lines = ["sessionId | runtime | daemonId | directory | summary | ageH"];
     for (const e of entries) {
       const label = e.summary ?? e.title ?? "";
       const ageH =
         typeof e.updatedAt === "number" ? ((now - e.updatedAt) / 3_600_000).toFixed(1) : "?";
-      lines.push(`${e.sessionId} | ${e.daemonId} | ${e.directory} | ${label} | ${ageH}`);
+      lines.push(`${e.sessionId} | ${runtimeOf(e)} | ${e.daemonId} | ${e.directory} | ${label} | ${ageH}`);
     }
     return lines.join("\n");
   } catch (err) {

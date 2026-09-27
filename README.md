@@ -28,6 +28,7 @@ Or from npm once published:
 | `fleet_discover` / `fleet_ps` | Discover live sessions + process/port join (v1 API first; ownership-annotated: owner / `unassigned` / `unknown`) |
 | `fleet_assign` / `fleet_unassign` / `fleet_transfer` | Claim a worker, release (one or all), transfer to another commander — exactly one owner per worker |
 | `fleet_my_workers` / `fleet_unassigned` | Your owned workers (incl. stale rows) / claimable workers with no owner |
+| `fleet_recover_commander` | After a daemon restart: recover your workers from a dead `oldDaemonId` to your current daemon (same sessionId, old pid must be exited; worker keys preserved, generations bumped) |
 | `fleet_broadcast` | Fan out to **your owned workers** by default / `only:[...]` (each must be yours) with `agent/model/variant`, waits for `.res.json` |
 | `fleet_exec` | Fast direct `promptAsync` + abort/retry, spool fallback — gated to workers you own (`force` never bypasses ownership) |
 | `fleet_status` / `fleet_thread` | Compact status + `DONE:` extraction over your owned workers / thread view |
@@ -60,6 +61,26 @@ Every delegation still lands as a normal user message (`agent` / `model` /
 `variant` / `system` replay hints preserved), and the global inbound policy
 (`commander-only` default, `hold`, `refuse`) is enforced after ownership on
 both send and delivery.
+
+## Restart recovery
+
+Same-process hostname flips heal automatically on the next heartbeat. After
+an actual daemon restart, quit and reopen OpenCode with the updated plugin,
+resume the **same** commander session ID, and register it if it has not yet
+heartbeated. Once the old PID has exited, run from that live commander session:
+
+```
+fleet_recover_commander({ oldDaemonId: "Mac.lan-81615-4096:v1" })
+```
+
+Only `assignment.commanderKey` migrates. Worker keys from a restarted daemon
+remain stale: same-process hostname changes heal on worker heartbeat, but a
+worker restarted under a new PID is a different identity and needs an explicit
+release/reassignment before it is controllable again. Each recovered row's
+generation bumps so old queued stamps go stale, and the journal/ACK cursor
+plus handoff origins follow. Refuses when
+the old pid is still alive, the caller is not the same live commander, or
+journals/origins are corrupt — never copy state files between machines.
 
 ## Protocol
 

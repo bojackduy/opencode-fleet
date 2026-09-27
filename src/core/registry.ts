@@ -18,6 +18,7 @@ import { chmod, cp, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { withV1Marker } from "./v1.js";
+import { migrateDaemonKeysUnlocked } from "./daemonMigration.js";
 import type { Role } from "./roles.js";
 
 /** Fleet runtime that owns a registry row. Missing reads as "v1". */
@@ -190,7 +191,58 @@ function enqueue<T>(fn: () => Promise<T>): Promise<T> {
 const LOCK_STALE_MS = 15_000;
 const LOCK_WAIT_MS = 60_000;
 
+/**
+ * Cross-process lock hold depth for THIS process. Diagnostic only: a
+ * concurrent operation may hold the lock while this call runs unlocked.
+ */
+let stateLockHeldDepth = 0;
+
+export function isStateLockHeld(): boolean {
+  try {
+    return stateLockHeldDepth > 0;
+  } catch {
+    return false;
+  }
+}
+
 export async function withStateLock<T>(fn: () => Promise<T>): Promise<T> {
+  const acquired = await acquireStateLock();
+  if (!acquired) {
+    // Degrade: run unlocked rather than hang a plugin tool forever.
+    return await fn();
+  }
+  try {
+    return await withStateLockHeld(fn);
+  } finally {
+    await releaseStateLock();
+  }
+}
+
+/**
+ * Strict cross-process lock for explicit operator recovery
+ * (fleet_recover_commander): NEVER runs fn unlocked. On acquisition timeout
+ * the callback is NOT executed and a fail-closed Error is thrown instead,
+ * so no mutation can happen on the degraded fallback path.
+ *
+ * The acquisition result is explicit per-call (mkdir success for THIS call),
+ * never the process-global {@link isStateLockHeld} depth — that depth may
+ * be nonzero due to an unrelated concurrent task holding the lock while
+ * this call is still waiting, which would falsely look "held". Never throws
+ * except the fail-closed lock-unavailable Error.
+ */
+export async function withStateLockStrict<T>(fn: () => Promise<T>): Promise<T> {
+  const acquired = await acquireStateLock();
+  if (!acquired) {
+    throw new Error("state lock unavailable; refusing (fail-closed, retry later)");
+  }
+  try {
+    return await withStateLockHeld(fn);
+  } finally {
+    await releaseStateLock();
+  }
+}
+
+async function acquireStateLock(): Promise<boolean> {
   const dir = `${registryPath()}.lock`;
   try {
     await mkdir(dirname(dir), { recursive: true });
@@ -201,7 +253,7 @@ export async function withStateLock<T>(fn: () => Promise<T>): Promise<T> {
   for (;;) {
     try {
       await mkdir(dir);
-      break;
+      return true;
     } catch {
       try {
         const st = await stat(dir);
@@ -212,17 +264,26 @@ export async function withStateLock<T>(fn: () => Promise<T>): Promise<T> {
       } catch {
         continue; // raced creation/removal; retry immediately.
       }
-      if (Date.now() > deadline) {
-        // Degrade: run unlocked rather than hang a plugin tool forever.
-        return await fn();
-      }
+      if (Date.now() > deadline) return false;
       await new Promise((r) => setTimeout(r, 50));
     }
   }
+}
+
+async function releaseStateLock(): Promise<void> {
+  try {
+    await rm(`${registryPath()}.lock`, { recursive: true, force: true });
+  } catch {
+    // best-effort release
+  }
+}
+
+async function withStateLockHeld<T>(fn: () => Promise<T>): Promise<T> {
+  stateLockHeldDepth++;
   try {
     return await fn();
   } finally {
-    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    stateLockHeldDepth--;
   }
 }
 
@@ -270,10 +331,17 @@ export type RegisterSelfInput = Omit<RegistryEntry, "updatedAt"> &
  * runtimes agree — so pre-v2 v1 rows keep updating in place). v2 daemonIds
  * (runtime "v2" or `v2:` prefix) skip the `:v1` marker. Serialized with the
  * in-process chain. Returns the stored entry.
+ *
+ * v1 registrations also trigger the daemon-identity migration
+ * (daemonMigration.ts): legacy hostname-daemon keys for this session (same
+ * sessionId + same numeric pid/port) are rewritten to the stable identity
+ * across the registry, assignments, journals, and handoff origins. The
+ * registration uses the strict lock so migration cannot run through an
+ * unlocked fallback; lock acquisition failures are retried by the next beat.
  */
 export async function registerSelf(input: RegisterSelfInput): Promise<RegistryEntry> {
   return enqueue(() =>
-    withStateLock(async () => {
+    withStateLockStrict(async () => {
       const entries = await readRegistry();
     const rt: FleetRuntime = input.runtime ?? runtimeOf({ runtime: undefined, daemonId: input.daemonId });
     const entry: RegistryEntry = {
@@ -282,6 +350,18 @@ export async function registerSelf(input: RegisterSelfInput): Promise<RegistryEn
       daemonId: rt === "v2" ? String(input.daemonId ?? "") : withV1Marker(input.daemonId),
       updatedAt: input.updatedAt ?? Date.now(),
     };
+    try {
+      if (rt === "v1") {
+        await migrateDaemonKeysUnlocked({
+          entries,
+          sessionId: entry.sessionId,
+          newDaemonId: entry.daemonId,
+          now: Date.now(),
+        });
+      }
+    } catch {
+      // best-effort: registration must succeed; migration retries next beat.
+    }
     const key = fleetKeyOf(entry);
     let idx = entries.findIndex((e) => fleetKeyOf(e) === key);
     if (idx < 0) {

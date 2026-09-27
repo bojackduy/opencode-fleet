@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.3 (2026-09-27) — Stable v1 daemon identity and ownership recovery
+
+- Replace hostname-based v1 daemon IDs with process-stable IDs so hostname changes no longer split a commander's fleet.
+- Migrate same-process legacy registry, assignment, journal/ACK, and handoff-origin keys when a session registers; refuse uncertain PID-reuse cases.
+- Add `fleet_recover_commander` for explicit recovery after a daemon restart, preserving worker keys and invalidating stale queued requests.
+- Allow the owning commander to release a stale worker assignment after the worker reconnects under a new daemon ID.
+- Add hostname-flip and restart-recovery regression tests.
+
 ## 0.2.1 (2026-09-27) — P6 live-roster + notify
 
 - Periodic re-beat (~60s, v1 adapter + v2 singleton): refreshes ONLY rows owned

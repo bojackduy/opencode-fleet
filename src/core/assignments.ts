@@ -696,19 +696,29 @@ export async function unassignWorker(
         return fail("state-unreadable", `registry state unreadable (${regIn.error ?? regIn.status}); refusing (fail-closed)`);
       }
       const freshIn = freshEntries(regIn.entries);
-      // Find the assignment: by resolved key, or — when the row is gone —
-      // any stale assignment whose worker sessionId matches.
-      let key = res.ok ? res.key : null;
-      let existing = key ? cur.state.assignments[key] : undefined;
-      if (!existing && !res.ok) {
-        const sid = String(worker.sessionId ?? "").trim();
-        const staleHit = Object.values(cur.state.assignments).find(
-          (a) => shortSessionOf(a.workerKey) === sid && !freshIn.some((e) => fleetKeyOf(e) === a.workerKey),
-        );
-        if (staleHit) {
-          key = staleHit.workerKey;
-          existing = staleHit;
-        }
+       // Find the assignment by live key first. After a worker restarts, its
+       // new registry row may resolve while the old assignment is still
+       // keyed by the dead daemon: permit releasing that stale row explicitly.
+       let key = res.ok ? res.key : null;
+       let existing = key ? cur.state.assignments[key] : undefined;
+       if (!existing) {
+         const sid = String(worker.sessionId ?? "").trim();
+         const staleHits = Object.values(cur.state.assignments).filter(
+           (a) => {
+             const [rt, daemon, id] = a.workerKey.split("\u0000");
+             return id === sid &&
+               (worker.runtime === undefined || worker.runtime === rt) &&
+               (worker.daemonId === undefined || worker.daemonId === daemon) &&
+               !freshIn.some((e) => fleetKeyOf(e) === a.workerKey);
+           },
+         );
+         if (staleHits.length > 1) {
+           return fail("ambiguous", `${sid} has ${staleHits.length} stale assignments; specify runtime and daemonId to release one`);
+         }
+         if (staleHits.length === 1) {
+           key = staleHits[0]!.workerKey;
+           existing = staleHits[0];
+         }
       }
       if (!existing || !key) {
         return fail("not-owned", `${String(worker.sessionId).trim()} is unassigned`);

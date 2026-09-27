@@ -13,8 +13,8 @@
  */
 
 import { readdir, readFile, writeFile } from "node:fs/promises";
-import { hostname } from "node:os";
 import { join } from "node:path";
+import { getStableDaemonId } from "./daemonIdentity.js";
 import { INBOX_POLL_MS, hopOf, isHopExceeded, loopGuardText, messagesDir, readReq, writeRes } from "./fileTransport.js";
 import { sameDaemon } from "./v1.js";
 import type { FleetEnvelope, FleetModel } from "./fileTransport.js";
@@ -57,25 +57,17 @@ export function messageListOf(raw: unknown): Array<{ info: any; parts: any[] }> 
 }
 
 /**
- * Daemon identity: `<hostname>-<pid>-<port>`.
- * Port is parsed out of the server URL; when the URL cannot be parsed the
- * raw serverUrl string is used as the trailing segment instead.
+ * Daemon identity: process-stable `proc-<pid>-<port>-<token>` (see
+ * daemonIdentity.ts). Deliberately hostname-free: recomputed on every call
+ * (heartbeat, callerIdentity, adapter server()), so a mid-process hostname
+ * flip can no longer fork the composite identity. Stable within the
+ * process across module re-imports; unique across restarts even when the
+ * OS reuses the PID/port (per-process random token). Port parsing keeps
+ * the historic tolerant rules; when the URL has no parseable port a
+ * content hash stands in for the port segment.
  */
 export function getDaemonId(serverUrl: string): string {
-  const host = hostname();
-  const pid = process.pid;
-  try {
-    const port = new URL(serverUrl).port;
-    if (port && port.trim() !== "") return `${host}-${pid}-${port}`;
-  } catch {
-    // Fall through to the raw-string fallback below.
-  }
-  // No parseable port — fall back to the raw string per spec.
-  // Try a trailing :port match so "http://127.0.0.1:14121" still yields "14121"
-  // even if URL parsing behaved unexpectedly.
-  const m = /:(\d+)(?:\/|$)/.exec(serverUrl);
-  if (m) return `${host}-${pid}-${m[1]}`;
-  return `${host}-${pid}-${serverUrl}`;
+  return getStableDaemonId(serverUrl);
 }
 
 /** Path of the `<reqId>.claimed` marker used to avoid double-pickup. */

@@ -46,7 +46,7 @@ function timeAgo(timeUpdated: number, now = Date.now()): string {
   }
 }
 
-/** Bare sessionId -> owning commander sessions (ownership annotation). Never throws. */
+/** Bare sessionId -> owning commander COMPOSITE keys (runtime/daemon/session, never bare). Never throws. */
 async function ownerAnnotations(): Promise<Map<string, string[]> | null> {
   try {
     const asg = await readAssignments();
@@ -54,9 +54,8 @@ async function ownerAnnotations(): Promise<Map<string, string[]> | null> {
     const map = new Map<string, string[]>();
     for (const a of Object.values(asg.state.assignments)) {
       const worker = shortSessionOf(a.workerKey);
-      const owner = shortSessionOf(a.commanderKey);
       const list = map.get(worker) ?? [];
-      if (!list.includes(owner)) list.push(owner);
+      if (!list.includes(a.commanderKey)) list.push(a.commanderKey);
       map.set(worker, list);
     }
     return map;
@@ -65,14 +64,25 @@ async function ownerAnnotations(): Promise<Map<string, string[]> | null> {
   }
 }
 
-/** One owner cell: `unassigned` (claimable), owner id, `a+b` on collision, `unknown` when unreadable. */
+/** Render one composite commander key as `runtime/daemonId/sessionId`. Never throws. */
+function displayKey(key: string): string {
+  try {
+    const parts = String(key ?? "").split("\u0000");
+    if (parts.length !== 3) return String(key ?? "");
+    return `${parts[0]}/${parts[1]}/${parts[2]}`;
+  } catch {
+    return String(key ?? "");
+  }
+}
+
+/** One owner cell: `unassigned` (claimable), composite owner key, `a+b` on collision, `unknown` when unreadable. */
 function ownerCell(sessionId: string, owners: Map<string, string[]> | null): string {
   try {
     if (owners === null) return "unknown";
     const list = owners.get(String(sessionId ?? "")) ?? [];
     if (list.length === 0) return "unassigned";
-    if (list.length === 1) return list[0] as string;
-    return `ambiguous(${list.length}):${list.join("+")}`;
+    if (list.length === 1) return displayKey(list[0] as string);
+    return `ambiguous(${list.length}):${list.map(displayKey).join("+")}`;
   } catch {
     return "unknown";
   }
