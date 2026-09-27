@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1 (2026-09-27) — P6 live-roster + notify
+
+- Periodic re-beat (~60s, v1 adapter + v2 singleton): refreshes ONLY rows owned
+  by this daemon with live title/agent/model/status; 24h TTL now means dead
+- Real status: `normalizeStatus()` maps daemon variants (running/working/…)
+  to busy/idle; v1 probes per-session status shapes; v2 folds
+  /api/session/active + time.idle/outcome into the row — unknown is last-resort
+- Roster-change notify: session.created → join, session.deleted → leave,
+  claim/release commander → role (`roster-*.notify.json`, 0600, never throws)
+- New `fleet_watch` tool (20th): blocks up to timeoutMs (default 30s, max 120s)
+  for roster + DONE notifies newer than `since` — the commander's subscribe
+  primitive replacing blind polling
+
 ## 0.2.0 (2026-09-25) — Rename to opencode-fleet (v1+v2 support); state dir opencode/fleet with auto-migration from opencode/fleet-v1 (0.1.x history below unchanged)
 
 - Package `@bojackduy/opencode-fleet`, plugin id `fleet`, state dir `opencode/fleet`

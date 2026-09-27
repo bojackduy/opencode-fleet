@@ -16,6 +16,9 @@
  *   watcher that claims v2 envelopes as normal user messages + DONE: replies.
  * - Heartbeat from session.created/idle/deleted + session.execution.*
  *   events (data.sessionID); registry rows carry runtime:"v2" + endpoint.
+ * - P6 live-roster: a process-wide ~60s re-beat refreshes rows owned by this
+ *   daemon, session.created/deleted emit roster notifies consumed by the
+ *   `fleet_watch` subscribe primitive (see core/tools/fleetWatch.ts).
  * - Feature-detect ctx.tool?.transform / ctx.session?.prompt /
  *   ctx.event?.subscribe; missing pieces degrade to spool-only + a log line.
  *
@@ -27,7 +30,7 @@
 
 import { appendFile, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { registerSelf, removeSessionScoped, stateDir, ensureStateMigrated } from "../core/registry.js";
+import { registerSelf, removeSessionScoped, readRegistry, stateDir, ensureStateMigrated } from "../core/registry.js";
 import type { RegistryEndpoint } from "../core/registry.js";
 import { ALL_TOOL_DEFS } from "../core/tools/index.js";
 import { z } from "../core/toolDef.js";
@@ -49,7 +52,7 @@ import {
   readReq,
   writeRes,
 } from "../core/fileTransport.js";
-import { writeNotify } from "../core/notify.js";
+import { writeNotify, writeRosterNotify } from "../core/notify.js";
 import {
   passwordForUrl,
   pollV2Done,
@@ -164,13 +167,15 @@ interface V2DaemonState {
   daemonId: string;
   serviceUrl: string;
   watcher: { stop: () => void } | null;
+  /** P6 process-wide periodic re-beat (own rows only). */
+  rebeat: { stop: () => void } | null;
 }
 
 function daemonState(): V2DaemonState {
   const g = globalThis as unknown as Record<symbol, V2DaemonState | undefined>;
   let s = g[DAEMON_KEY];
   if (!s) {
-    s = { refs: new Map(), apis: new Map(), daemonId: "", serviceUrl: "", watcher: null };
+    s = { refs: new Map(), apis: new Map(), daemonId: "", serviceUrl: "", watcher: null, rebeat: null };
     g[DAEMON_KEY] = s;
   }
   return s;
@@ -335,6 +340,21 @@ async function heartbeatAndRegisterV2(
     let agent = "";
     let model = "";
     let parentID = "";
+    let status = "unknown";
+    try {
+      // Prefer rt.sessionInfo: it folds the /api/session/active map into a
+      // real busy flag (busy → "busy", idle → "idle"); unknown only when the
+      // runtime cannot tell. Raw session.get is the enrichment fallback.
+      const info = await rt.sessionInfo(sessionId).catch(() => null);
+      if (info) {
+        title = info.title;
+        agent = info.agent;
+        model = info.model;
+        status = info.busy === true ? "busy" : info.busy === false ? "idle" : "unknown";
+      }
+    } catch {
+      // fall through to raw enrichment
+    }
     try {
       const raw = await tolerantSessionGet(api, sessionId);
       const data =
@@ -343,10 +363,17 @@ async function heartbeatAndRegisterV2(
           : raw;
       if (data !== null && typeof data === "object") {
         const o = data as Record<string, unknown>;
-        if (typeof o["title"] === "string") title = o["title"] as string;
+        if (title === "" && typeof o["title"] === "string") title = o["title"] as string;
         const st = v2SessionStateOf(data, null);
-        agent = st.agent;
-        model = st.model;
+        if (agent === "") agent = st.agent;
+        if (model === "") model = st.model;
+        if (status === "unknown") {
+          // time.idle + outcome fallback: a live row we just touched is at
+          // worst idle — unknown only when we have no signal at all.
+          if (st.busy === true) status = "busy";
+          else if (st.busy === false) status = "idle";
+          else if (st.idleAt !== null || st.outcome !== "") status = "idle";
+        }
         parentID = parentIdOf(data);
       }
     } catch {
@@ -363,6 +390,7 @@ async function heartbeatAndRegisterV2(
       ...(title !== "" ? { title } : {}),
       ...(agent !== "" ? { agent } : {}),
       ...(model !== "" ? { model } : {}),
+      ...(status !== "" ? { status } : {}),
       role,
       ...(parentID !== "" ? { parentID } : {}),
       updatedAt: Date.now(),
@@ -400,12 +428,25 @@ async function runEventLoop(
           type === "session.execution.interrupted" ||
           type === "session.status"
         ) {
+          const isJoin = type === "session.created";
           await heartbeatAndRegisterV2(rt, api, sessionId, location);
+          if (isJoin) {
+            try {
+              await writeRosterNotify("join", { sessionId, directory: location });
+            } catch {
+              // roster notify is best-effort
+            }
+          }
         } else if (type === "session.deleted") {
           try {
             await removeSessionScoped(sessionId, { runtime: "v2" });
           } catch {
             // best-effort
+          }
+          try {
+            await writeRosterNotify("leave", { sessionId, directory: location });
+          } catch {
+            // roster notify is best-effort
           }
         }
       } catch (err) {
@@ -576,6 +617,111 @@ function startV2SpoolWatcher(log: Runtime["log"]): { stop: () => void } {
   };
 }
 
+/** P6 re-beat cadence: process-wide refresh of own rows (~60s). */
+const V2_REBEAT_MS = 60_000;
+
+/**
+ * P6 periodic re-beat: every V2_REBEAT_MS, refresh ONLY rows owned by this
+ * daemon (exact daemonId match — v2 ids are stable `v2:<url>`; never touch
+ * other daemons' rows) via the hosting location's session surface.
+ * Best-effort — never throws out of the interval.
+ */
+function startV2Rebeat(log: Runtime["log"]): { stop: () => void } {
+  let running = true;
+  const timer: ReturnType<typeof setInterval> = setInterval(() => {
+    if (!running) return;
+    void (async () => {
+      try {
+        const s = daemonState();
+        if (s.daemonId === "") return;
+        if (s.apis.size === 0) return;
+        const entries = await readRegistry().catch(() => []);
+        const own = entries.filter((e) => {
+          try {
+            return e.daemonId === s.daemonId;
+          } catch {
+            return false;
+          }
+        });
+        for (const row of own) {
+          try {
+            // Find the location actually hosting this session.
+            let hostLocation = "";
+            let hostApi: V2LocationApi | undefined;
+            for (const [location, api] of s.apis) {
+              try {
+                const r = await tolerantSessionGet(api, row.sessionId);
+                if (r !== null && r !== undefined) {
+                  hostLocation = location;
+                  hostApi = api;
+                  break;
+                }
+              } catch {
+                // try next location
+              }
+            }
+            if (!hostApi) continue; // not hosted here anymore; leave the row
+            const miniRt: Runtime = {
+              kind: "v2",
+              daemonId: s.daemonId,
+              client: undefined,
+              serverUrl: "",
+              selfEndpoint: () => toEndpoint(s.serviceUrl, hostLocation),
+              promptLocal: async () => {
+                throw new Error("rebeat has no prompt surface");
+              },
+              sessionInfo: async (sessionId) => {
+                try {
+                  const raw = await tolerantSessionGet(hostApi, sessionId);
+                  if (raw === null || raw === undefined) return null;
+                  const data =
+                    raw !== null && typeof raw === "object" && "data" in (raw as Record<string, unknown>)
+                      ? (raw as { data: unknown }).data
+                      : raw;
+                  let active: Record<string, string> | null = null;
+                  if (s.serviceUrl !== "") {
+                    try {
+                      const pw = await passwordForUrl(s.serviceUrl).catch(() => "");
+                      if (pw !== "") active = await v2ActiveMap(s.serviceUrl, pw).catch(() => null);
+                    } catch {
+                      // best-effort
+                    }
+                  }
+                  const st = v2SessionStateOf(data, active);
+                  return {
+                    title: st.title,
+                    agent: st.agent,
+                    model: st.model,
+                    busy: st.busy,
+                    idleAt: st.idleAt,
+                  };
+                } catch {
+                  return null;
+                }
+              },
+              log,
+            };
+            await heartbeatAndRegisterV2(miniRt, hostApi, row.sessionId, hostLocation);
+          } catch (err) {
+            log("warn", `fleet v2 re-beat ${row.sessionId}: ${toReadableError(err)}`);
+          }
+        }
+      } catch (err) {
+        log("warn", `fleet v2 re-beat scan error: ${toReadableError(err)}`);
+      }
+    })();
+  }, V2_REBEAT_MS);
+  if (typeof (timer as unknown as { unref?: () => void }).unref === "function") {
+    (timer as unknown as { unref: () => void }).unref();
+  }
+  return {
+    stop: () => {
+      running = false;
+      clearInterval(timer);
+    },
+  };
+}
+
 // ---- setup ----
 
 export async function v2Setup(ctx: V2Context): Promise<(() => void) | void> {
@@ -645,6 +791,10 @@ export async function v2Setup(ctx: V2Context): Promise<(() => void) | void> {
     s.watcher = startV2SpoolWatcher(log);
     log("info", "fleet v2 spool watcher started (process-wide)");
   }
+  if (!s.rebeat) {
+    s.rebeat = startV2Rebeat(log);
+    log("info", "fleet v2 re-beat started (process-wide, own rows only)");
+  }
 
   // Event-driven heartbeat for this location.
   const aborter = new AbortController();
@@ -677,6 +827,14 @@ export async function v2Setup(ctx: V2Context): Promise<(() => void) | void> {
           // ignore
         }
         st.watcher = null;
+      }
+      if (st.refs.size === 0 && st.rebeat) {
+        try {
+          st.rebeat.stop();
+        } catch {
+          // ignore
+        }
+        st.rebeat = null;
       }
     } catch {
       // ignore

@@ -24,6 +24,7 @@ import {
   fleetReleaseCommanderDef,
   fleetTreeDef,
 } from "./fleetRoles.js";
+import { fleetWatchDef } from "./fleetWatch.js";
 
 export const ALL_TOOL_DEFS: readonly ToolDef[] = [
   fleetRegisterDef,
@@ -45,4 +46,5 @@ export const ALL_TOOL_DEFS: readonly ToolDef[] = [
   fleetClaimCommanderDef,
   fleetReleaseCommanderDef,
   fleetTreeDef,
+  fleetWatchDef,
 ];

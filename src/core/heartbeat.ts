@@ -121,26 +121,72 @@ function userAgentModelOf(messages: unknown): { agent: string; model: string } {
   }
 }
 
+/**
+ * Normalize a raw status string to the roster vocabulary: "busy" | "idle" |
+ * "unknown". Matches substrings so daemon variants ("running", "working",
+ * "active", "in_progress", "processing", "done", "complete", …) map to real
+ * roster states; "unknown" is the last-resort fallback only. Never throws.
+ */
+export function normalizeStatus(raw: unknown): string {
+  try {
+    const s = String(raw ?? "").trim().toLowerCase();
+    if (s === "") return "unknown";
+    if (/(busy|running|working|active|in_?progress|processing|execut|pending|queued|waiting)/.test(s)) {
+      // "waiting" covers queued-but-live workers; truly dead rows age out via TTL.
+      return "busy";
+    }
+    if (/(idle|done|complete|success|succeed|finish|ready|stopped)/.test(s)) return "idle";
+    if (s === "busy" || s === "idle") return s;
+    return s === "unknown" ? "unknown" : s;
+  } catch {
+    return "unknown";
+  }
+}
+
 function statusTextOf(statusMap: unknown, sessionId: string): string {
   try {
+    const norm = (v: unknown): string | null => {
+      if (typeof v === "string" && v.trim() !== "") return normalizeStatus(v);
+      if (typeof v === "object" && v !== null) {
+        const o = v as Record<string, unknown>;
+        for (const k of ["type", "status", "state", "value", "label"]) {
+          const cand = o[k];
+          if (typeof cand === "string" && cand.trim() !== "") return normalizeStatus(cand);
+        }
+        // Boolean-ish payloads: {busy:true} / {idle:true} / {running:true}.
+        for (const [k, want] of [["busy", "busy"], ["running", "busy"], ["active", "busy"], ["idle", "idle"]] as const) {
+          if (o[k] === true) return want;
+        }
+        return null;
+      }
+      if (typeof v === "boolean") return v ? "busy" : "idle";
+      if (typeof v === "number" && Number.isFinite(v)) return v > 0 ? "busy" : "idle";
+      return null;
+    };
     if (statusMap === null || statusMap === undefined) return "unknown";
     const m = statusMap as Record<string, unknown>;
-    const v = m[sessionId] ?? m[sessionId.replace(/-/g, "")];
-    if (v === undefined || v === null) {
-      // Some daemons return a single status object instead of a map.
-      if (typeof m["type"] === "string") return String(m["type"]);
-      return "unknown";
+    const variants = [sessionId];
+    try {
+      variants.push(sessionId.replace(/-/g, ""));
+    } catch {
+      // ignore
     }
-    if (typeof v === "string") return v;
-    if (typeof v === "object") {
-      const cand =
-        (v as Record<string, unknown>)["type"] ??
-        (v as Record<string, unknown>)["status"] ??
-        (v as Record<string, unknown>)["state"];
-      if (typeof cand === "string" && cand !== "") return cand;
-      return "unknown";
+    for (const key of variants) {
+      if (key === "") continue;
+      if (key in m) {
+        const hit = norm(m[key]);
+        if (hit !== null) return hit;
+      }
     }
-    return String(v);
+    // Some daemons return a single status object instead of a map.
+    for (const k of ["type", "status", "state", "value", "label"]) {
+      if (typeof m[k] === "string" && String(m[k]).trim() !== "") return normalizeStatus(m[k]);
+    }
+    // Single boolean/number payload.
+    if (typeof (m as { busy?: unknown }).busy === "boolean") {
+      return (m as { busy: boolean }).busy ? "busy" : "idle";
+    }
+    return "unknown";
   } catch {
     return "unknown";
   }
@@ -301,8 +347,34 @@ export async function beat(input: BeatInput): Promise<Heartbeat> {
 
     let status = "unknown";
     try {
-      const rawStatus = await client.session.status();
+      // Try the arg-less map form first, then per-session shapes — SDK
+      // versions differ, so probe tolerantly and normalize every hit.
+      // "unknown" survives only when every shape fails or is empty.
+      let rawStatus: unknown = null;
+      try {
+        rawStatus = await client.session.status();
+      } catch {
+        rawStatus = null;
+      }
       status = statusTextOf(unwrap<unknown>(rawStatus), sessionId);
+      if (status === "unknown" && typeof client.session.status === "function") {
+        for (const args of [
+          { path: { id: sessionId } },
+          { sessionID: sessionId },
+          sessionId,
+        ]) {
+          try {
+            const r = await client.session.status(args);
+            const hit = statusTextOf(unwrap<unknown>(r), sessionId);
+            if (hit !== "unknown") {
+              status = hit;
+              break;
+            }
+          } catch {
+            // try the next shape
+          }
+        }
+      }
     } catch (err) {
       await appLog(client, `fleet heartbeat: session.status failed for ${sessionId}: ${toReadableError(err)}`);
     }

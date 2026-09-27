@@ -11,6 +11,10 @@
  * envelope.targetSessionId via client.session.promptAsync — as a normal
  * user bubble (never noReply/silent) so manual takeover with
  * revert/fork/continue keeps working.
+ *
+ * P6 live-roster: a daemon-wide ~60s re-beat refreshes rows owned by this
+ * daemon, and session.created/deleted emit roster notifies consumed by the
+ * `fleet_watch` subscribe primitive (see core/tools/fleetWatch.ts).
  */
 
 import { tool } from "@opencode-ai/plugin";
@@ -35,8 +39,9 @@ import {
   writeRes,
 } from "../core/fileTransport.js";
 import { readRegistry, registerSelf, removeSession, ensureStateMigrated } from "../core/registry.js";
+import { runtimeOf } from "../core/registry.js";
 import { beat } from "../core/heartbeat.js";
-import { writeNotify } from "../core/notify.js";
+import { writeNotify, writeRosterNotify } from "../core/notify.js";
 import { ALL_TOOL_DEFS } from "../core/tools/index.js";
 import type { ToolDef } from "../core/toolDef.js";
 import type { CallCtx, LogLevel, Runtime } from "../core/runtime.js";
@@ -285,6 +290,60 @@ function startDaemonWatcher(
   };
 }
 
+/** P6 re-beat cadence: daemon-wide refresh of own rows (~60s). */
+const REBEAT_MS = 60_000;
+
+/**
+ * P6 periodic re-beat: every REBEAT_MS, refresh ONLY rows owned by this
+ * daemon (marker-insensitive daemonId match, v1 runtime rows only — never
+ * touch other daemons' rows) with live title/agent/model/status via beat().
+ * Best-effort — never throws out of the interval.
+ */
+function startPeriodicRebeat(
+  client: PluginInput["client"],
+  serverUrlStr: string,
+  daemonId: string,
+  beatOne: (sessionId: string) => Promise<void>,
+  log: (m: string) => void,
+): { stop: () => void } {
+  let running = true;
+  const timer: ReturnType<typeof setInterval> = setInterval(() => {
+    if (!running) return;
+    void (async () => {
+      try {
+        if (!isV1Daemon(serverUrlStr)) return;
+        const entries = await readRegistry().catch(() => []);
+        const own = entries.filter((e) => {
+          try {
+            if (runtimeOf(e) === "v2") return false;
+            return sameDaemon(e.daemonId, daemonId);
+          } catch {
+            return false;
+          }
+        });
+        for (const e of own) {
+          try {
+            await beatOne(e.sessionId);
+          } catch (err) {
+            log(`fleet re-beat ${e.sessionId}: ${toReadableError(err)}`);
+          }
+        }
+      } catch (err) {
+        log(`fleet re-beat scan error: ${toReadableError(err)}`);
+      }
+    })();
+  }, REBEAT_MS);
+  if (typeof (timer as unknown as { unref?: () => void }).unref === "function") {
+    (timer as unknown as { unref: () => void }).unref();
+  }
+  return {
+    stop: () => {
+      running = false;
+      clearInterval(timer);
+    },
+  };
+}
+
 /** v1 Runtime backed by the v1 plugin client (HTTP SDK) + serverUrl. */
 function makeV1Runtime(
   client: PluginInput["client"],
@@ -441,6 +500,11 @@ export async function server(input: PluginInput) {
     }
   };
 
+  // P6 periodic re-beat (daemon-wide ~60s, own v1 rows only).
+  const rebeat = startPeriodicRebeat(client, serverUrlStr, daemonId, heartbeatAndRegister, (m) => {
+    void appLog(m).catch(() => undefined);
+  });
+
   // Startup best-effort auto-register via heartbeat: server() is daemon-wide
   // with no sessionID, but some hosts stash one on the input — use it if present.
   try {
@@ -472,6 +536,17 @@ export async function server(input: PluginInput) {
           // Auto-register new sessions via heartbeat (v1 daemons only).
           if (sessionId !== "" && isV1Daemon(serverUrlStr)) {
             await heartbeatAndRegister(sessionId);
+            try {
+              const entries = await readRegistry().catch(() => []);
+              const row = entries.find((x) => x.sessionId === sessionId);
+              await writeRosterNotify("join", {
+                sessionId,
+                title: String(row?.title ?? row?.summary ?? ""),
+                directory: String(row?.directory ?? input.directory ?? ""),
+              });
+            } catch {
+              // roster notify is best-effort
+            }
           }
           return;
         }
@@ -481,6 +556,11 @@ export async function server(input: PluginInput) {
               await removeSession(sessionId);
             } catch {
               // best-effort
+            }
+            try {
+              await writeRosterNotify("leave", { sessionId });
+            } catch {
+              // roster notify is best-effort
             }
           }
           return;
@@ -507,6 +587,11 @@ export async function server(input: PluginInput) {
     dispose: async () => {
       try {
         handle.watcher.stop();
+      } catch {
+        // ignore
+      }
+      try {
+        rebeat.stop();
       } catch {
         // ignore
       }

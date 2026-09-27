@@ -13,6 +13,7 @@
 import { listCommanders, addCommander, removeCommander } from "./auth.js";
 import { readRegistry, registerSelf } from "./registry.js";
 import type { RegistryEntry } from "./registry.js";
+import { writeRosterNotify } from "./notify.js";
 
 export type Role = "commander" | "worker" | "peer";
 
@@ -109,7 +110,8 @@ async function stampRegistryRole(sessionId: string, role: Role): Promise<void> {
 /**
  * Claim commander: adds to auth.json commanders + stamps registry role.
  * Returns the resulting role ("commander", or "peer" on empty/invalid input).
- * Never throws.
+ * Emits a roster "role" notify so `fleet_watch` subscribers learn of the
+ * change without polling. Never throws.
  */
 export async function claimCommander(sessionId: string): Promise<Role> {
   try {
@@ -117,6 +119,17 @@ export async function claimCommander(sessionId: string): Promise<Role> {
     if (id === "") return DEFAULT_ROLE;
     await addCommander(id).catch(() => [] as string[]);
     await stampRegistryRole(id, "commander");
+    try {
+      const entries = await readRegistry().catch(() => [] as RegistryEntry[]);
+      const e = entries.find((x) => x.sessionId === id);
+      await writeRosterNotify("role", {
+        sessionId: id,
+        title: String(e?.title ?? e?.summary ?? ""),
+        directory: String(e?.directory ?? ""),
+      });
+    } catch {
+      // roster notify is best-effort
+    }
     return "commander";
   } catch {
     return DEFAULT_ROLE;
@@ -125,7 +138,8 @@ export async function claimCommander(sessionId: string): Promise<Role> {
 
 /**
  * Release commander: removes from auth.json commanders + stamps registry
- * role back to "peer". Returns "peer". Never throws.
+ * role back to "peer". Returns "peer". Emits a roster "role" notify.
+ * Never throws.
  */
 export async function releaseCommander(sessionId: string): Promise<Role> {
   try {
@@ -133,6 +147,17 @@ export async function releaseCommander(sessionId: string): Promise<Role> {
     if (id === "") return DEFAULT_ROLE;
     await removeCommander(id).catch(() => [] as string[]);
     await stampRegistryRole(id, "peer");
+    try {
+      const entries = await readRegistry().catch(() => [] as RegistryEntry[]);
+      const e = entries.find((x) => x.sessionId === id);
+      await writeRosterNotify("role", {
+        sessionId: id,
+        title: String(e?.title ?? e?.summary ?? ""),
+        directory: String(e?.directory ?? ""),
+      });
+    } catch {
+      // roster notify is best-effort
+    }
     return DEFAULT_ROLE;
   } catch {
     return DEFAULT_ROLE;

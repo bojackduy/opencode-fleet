@@ -67,6 +67,54 @@ export async function writeNotify(
   }
 }
 
+export interface RosterChange {
+  kind: "roster";
+  change: "join" | "leave" | "role";
+  sessionId: string;
+  title: string;
+  directory: string;
+  at: number;
+}
+
+function sanitizeSessionId(raw: unknown): string {
+  try {
+    const s = String(raw ?? "").trim().replace(/[^A-Za-z0-9._-]+/g, "_");
+    return s === "" ? "unknown" : s.slice(0, 80);
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
+ * Write a roster-change notification (`roster-<at>-<sessionId>.notify.json`):
+ * {kind:"roster", change:"join"|"leave"|"role", sessionId, title, directory, at}.
+ * Best-effort — never throws. Files are 0600 via atomicWriteJson.
+ */
+export async function writeRosterNotify(
+  change: RosterChange["change"],
+  info: { sessionId: string; title?: string; directory?: string; at?: number },
+): Promise<void> {
+  try {
+    const at =
+      typeof info?.at === "number" && Number.isFinite(info.at) ? info.at : Date.now();
+    const sessionId = String(info?.sessionId ?? "");
+    if (sessionId.trim() === "") return;
+    if (change !== "join" && change !== "leave" && change !== "role") return;
+    const note: RosterChange = {
+      kind: "roster",
+      change,
+      sessionId,
+      title: String(info?.title ?? ""),
+      directory: String(info?.directory ?? ""),
+      at,
+    };
+    const name = `roster-${at}-${sanitizeSessionId(sessionId)}.notify.json`;
+    await atomicWriteJson(join(messagesDir(), name), note);
+  } catch {
+    // best-effort only — roster notify must never break the event path.
+  }
+}
+
 /** Read one notification; null when absent/unreadable. Never throws. */
 export async function readNotify(reqId: string): Promise<FleetNotify | null> {
   try {
