@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.4 (2026-09-28) — Direct v1 routing, liveness, doctor, skill
+
+- Stamp v1 daemon endpoint URLs at register/heartbeat (routing metadata only)
+- Direct cross-daemon v1 transport: same-daemon → remote owning-daemon HTTP
+  (`POST /session/{id}/prompt_async`, no auth) → spool fallback; ownership
+  revalidated immediately before every live prompt, never double-delivers
+- Heartbeat-age liveness gating (live/stale/dead); dead/stale targets fail
+  fast instead of burning full timeouts; default views hide dead rows
+- Honest `fleet_ps` pid/port hints and registry-heartbeat status fallback
+- New read-only `fleet_doctor` tool (28th): exact next commands for
+  peer/commander/recovery states
+- New `skills/fleet/SKILL.md` commander/worker workflow, shipped in npm files
+
 ## 0.2.3 (2026-09-27) — Stable v1 daemon identity and ownership recovery
 
 - Replace hostname-based v1 daemon IDs with process-stable IDs so hostname changes no longer split a commander's fleet.
