@@ -354,42 +354,26 @@ export async function fleetPs(limit = 50, client?: unknown): Promise<FleetPsRow[
       await logDeprecated(client, "fleet_ps sqlite fallback: registry empty");
       const legacy = await discoverSessionsLegacy(n).catch(() => [] as DiscoveredSession[]);
       if (legacy.length === 0) return [];
-      return toPsRows(legacy.slice(0, n), "", "", new Map());
+      return toPsRows(legacy.slice(0, n));
     }
-    // Deprecated extras only: pid/port hints.
-    let hints: PsHint[] = [];
-    let ports = new Map<string, string>();
-    try {
-      hints = await psHints().catch(() => [] as PsHint[]);
-      ports = await lsofPorts().catch(() => new Map<string, string>());
-    } catch {
-      // hints stay empty
-    }
-    const fallbackPid = hints.length > 0 ? (hints[0]?.pid ?? "") : "";
-    const fallbackPort = hints.map((h) => h.port).find((p) => p !== "") ?? "";
-    return toPsRows(sessions.slice(0, n), fallbackPid, fallbackPort, ports);
+    // No ps/lsof attribution: process hints cannot be mapped to individual
+    // sessions, so pid/port stay EMPTY (honest unknown). The deprecated
+    // psHints/lsofPorts helpers below remain for compat but are not consulted.
+    return toPsRows(sessions.slice(0, n));
   } catch {
     return [];
   }
 }
 
-function toPsRows(
-  sessions: DiscoveredSession[],
-  fallbackPid: string,
-  fallbackPort: string,
-  ports: Map<string, string>,
-): FleetPsRow[] {
+function toPsRows(sessions: DiscoveredSession[]): FleetPsRow[] {
   const now = Date.now();
   return sessions.map((s) => {
-    const pidHint = fallbackPid;
-    let portHint = fallbackPort;
-    if (pidHint !== "" && ports.has(pidHint)) portHint = ports.get(pidHint) ?? portHint;
     return {
       sessionId: s.id,
       title: s.title,
       directory: s.directory,
-      pidHint,
-      portHint,
+      pidHint: "",
+      portHint: "",
       registered: s.registered,
       age: ageOf(s.timeUpdated, now),
     };

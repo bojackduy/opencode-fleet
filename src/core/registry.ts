@@ -57,7 +57,7 @@ export interface RegistryEntry {
    * runtimes (they share the id format but no live state).
    */
   runtime?: FleetRuntime;
-  /** V2 endpoint descriptor (url); v1 rows leave this absent. */
+  /** Endpoint descriptor (routing metadata only, never ownership): v1 rows stamp {kind:'v1-daemon', url:serverUrl}. */
   endpoint?: RegistryEndpoint;
   /** V2 location directory (per-location plugin instance). */
   location?: string;

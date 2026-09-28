@@ -29,6 +29,8 @@ import type { RegistryEntry } from "../registry.js";
 import { passwordForUrl, pollV2Done, v2PromptRemote } from "../v2transport.js";
 import { doneNoteFor, emitOwnershipEvent } from "../ownershipEvents.js";
 import { gateSendToWorker, stampEnvelope, validateDelivery } from "../ownershipControl.js";
+import { isLiveEntry, notLiveError } from "../liveness.js";
+import { isV1HttpTarget, normalizeV1BaseUrl, pollV1Done, v1PromptRemote } from "../v1transport.js";
 import { originFromStamped, recordHandoffOriginStrict } from "../ownershipControl.js";
 import type { SessionSelector } from "../assignments.js";
 
@@ -252,6 +254,12 @@ export async function fleetExecHandler(args: any, context: any, deps?: FleetTool
     if (!entry) {
       return `fleet_exec failed: ${sessionId} not in registry (suggest fleet_discover to find live sessions)`;
     }
+    // Liveness gate: fail fast on stale/dead targets instead of burning the
+    // full DONE: timeout on direct + spool paths nobody is left to serve
+    // (the owning daemon is not beating). Never spool after this decision.
+    if (!isLiveEntry(entry)) {
+      return `fleet_exec failed: ${notLiveError(sessionId, entry)}`;
+    }
 
     const reqId = `exec-${Date.now()}-${randomSuffix()}`;
     const modelRaw = (args as any)?.model as FleetEnvelope["model"];
@@ -283,11 +291,17 @@ export async function fleetExecHandler(args: any, context: any, deps?: FleetTool
     if (mode === "direct") {
       const direct = await tryDirect(client, sessionId, inject, envelope, timeoutMs, abortOnBusy, signal, entry);
       if (direct.ok) return direct.text;
-      // Fall through to spool only when direct looks like an asleep-daemon
-      // failure. Busy/timeout/abort stays a direct error (no spool point:
-      // same daemon already failed live).
+      // Fall through to v1-remote/spool only when direct looks like an
+      // asleep-daemon failure. Busy/timeout/abort stays a direct error (no
+      // spool point: same daemon already failed live).
       if (!direct.fallbackToSpool) return direct.text;
     }
+
+    // Cross-daemon v1: remote owning-daemon HTTP before spool fallback.
+    // Same-daemon targets (or rows without a usable endpoint) skip straight
+    // to spool. Never spool after an accepted remote prompt (double-deliver).
+    const remote = await tryV1Remote(sessionId, entry, envelope, inject, timeoutMs, signal, deps);
+    if (remote !== null) return remote;
 
     return await spoolFallback(sessionId, envelope, timeoutMs, signal, entry);
   } catch (err) {
@@ -395,8 +409,82 @@ async function execToV2(
   return await spoolFallback(sessionId, envelope, timeoutMs, signal, entry);
 }
 
-async function tryDirect(
-  client: any,
+/**
+ * Cross-daemon v1 remote attempt (routing step 2 of 3: same-daemon direct
+ * already failed or was skipped, spool fallback is next). Returns null when
+ * not attempted (same-daemon target, or the row carries no usable v1
+ * endpoint) so the caller falls through to spool honestly. On an ACCEPTED
+ * remote prompt (`POST {url}/session/{id}/prompt_async` → 2xx) the durable
+ * handoff origin is persisted and the reply is awaited via DONE poll over
+ * the remote message list — callers must NEVER spool after this
+ * (double-delivery). Never throws.
+ */
+async function tryV1Remote(
+  sessionId: string,
+  entry: RegistryEntry,
+  envelope: FleetEnvelope,
+  inject: string,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+  deps?: FleetToolDeps,
+): Promise<string | null> {
+  try {
+    if (runtimeOf(entry) !== "v1") return null;
+    const targetUrl = normalizeV1BaseUrl(entry.endpoint?.url);
+    if (!isV1HttpTarget(targetUrl)) return null;
+    // Same-daemon targets are served by direct/spool, never remote HTTP
+    // (prompting our own daemon over the loopback would double-handle).
+    const selfRaw = deps?.rt?.serverUrl ?? deps?.serverUrl ?? "";
+    const selfUrl = normalizeV1BaseUrl(typeof selfRaw === "string" ? selfRaw : String(selfRaw ?? ""));
+    if (selfUrl !== "" && selfUrl === targetUrl) return null;
+    const denied = await revalidateForward(sessionId, envelope, entry);
+    if (denied) return denied;
+    const parsedModel = parseFleetModel(envelope.model);
+    const accepted = await v1PromptRemote(targetUrl, sessionId, {
+      parts: [{ type: "text", text: inject }],
+      ...(envelope.agent ? { agent: envelope.agent } : {}),
+      ...(parsedModel ? { model: parsedModel } : {}),
+      ...(envelope.variant ? { variant: envelope.variant } : {}),
+      ...(envelope.system ? { system: envelope.system } : {}),
+    }).catch(() => false);
+    if (!accepted) return null;
+    // Accepted remotely: persist origin before polling so timeouts still
+    // leave takeover working. Never spool after this.
+    const originWarning = await persistAcceptedOrigin(envelope);
+    const since = Date.now();
+    const reply = await pollV1Done(targetUrl, sessionId, since, timeoutMs, signal);
+    if (signal?.aborted) {
+      return withOriginWarning(`${sessionId} | via:v1-http | error: aborted`, originWarning);
+    }
+    if (reply === null) {
+      return withOriginWarning(
+        `${sessionId} | via:v1-http | error: timeout after ${timeoutMs}ms waiting for DONE: reply`,
+        originWarning,
+      );
+    }
+    const done = doneLineOf(reply);
+    if (done === null || done.trim() === "") {
+      return withOriginWarning(
+        `${sessionId} | via:v1-http | error: no trailing DONE: line found`,
+        originWarning,
+      );
+    }
+    // Phase B1: scoped DONE to the assigned commander only (snippet).
+    try {
+      await emitOwnershipEvent(fleetKeyOf(entry), "done", doneNoteFor(done.trim())).catch(() => null);
+    } catch {
+      // scoped notify is best-effort
+    }
+    return withOriginWarning(
+      `${sessionId} | via:v1-http | ok | DONE:${done.trim()} | ${snippetOf(reply)}`,
+      originWarning,
+    );
+  } catch {
+    return null;
+  }
+}
+
+async function tryDirect(  client: any,
   sessionId: string,
   inject: string,
   envelope: FleetEnvelope,
@@ -622,7 +710,7 @@ async function spoolFallback(
 export const fleetExecDef: ToolDef = {
   name: "fleet_exec",
   description:
-    "Execute a self-contained task on one fleet worker you own (exclusive ownership gated; bare sessionId only when unambiguous, else pass the composite selector). Fast direct promptAsync, falling back to file-spool when the owning daemon is asleep. Returns sessionId | via | ok | DONE line | snippet.",
+    "Execute a self-contained task on one live fleet worker you own (exclusive ownership gated; bare sessionId only when unambiguous, else pass the composite selector). Same-daemon direct promptAsync, then remote owning-daemon HTTP, then file-spool. Stale/dead targets fail fast (run fleet_doctor). Returns sessionId | via | ok | DONE line | snippet.",
   args: {
     sessionId: z.string().describe("Target worker session id (must be owned by you)"),
     message: z

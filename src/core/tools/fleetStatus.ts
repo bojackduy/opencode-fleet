@@ -16,6 +16,8 @@ import { listRegistry, runtimeOf } from "../registry.js";
 import type { RegistryEntry } from "../registry.js";
 import { lookupAssignment } from "../assignments.js";
 import { scopedRegistryEntries } from "../ownershipControl.js";
+import { ageTextOf, liveEntries } from "../liveness.js";
+import { isV1HttpTarget, normalizeV1BaseUrl, v1AssistantText, v1StatusMap, v1StatusOf, V1_PROBE_TIMEOUT_MS } from "../v1transport.js";
 import { messageListOf } from "../inbox.js";
 import { passwordForUrl, v2ActiveMap, v2AssistantText } from "../v2transport.js";
 
@@ -107,7 +109,13 @@ export async function fleetStatusHandler(
     if (requested.length > 0) {
       ids = requested;
     } else {
-      ids = scoped.owned.map((e) => e.sessionId);
+      // Default rows cover live-owned workers only (stale/dead rows fail
+      // fast at send time; explicit sessionIds still render per-row).
+      const live = liveEntries([...scoped.owned]);
+      if (live.length === 0 && scoped.owned.length > 0) {
+        return `no live workers assigned to you (${scoped.owned.length} owned but stale/dead; run fleet_doctor for the next command)`;
+      }
+      ids = live.map((e) => e.sessionId);
     }
     if (ids.length === 0) {
       return requested.length > 0
@@ -181,8 +189,10 @@ export async function fleetStatusHandler(
 
 /**
  * Status row without a v1 client: v2 rows via the service HTTP API
- * (/api/session/active + message list DONE: parse); anything unreachable
- * falls back to the registry heartbeat (status/lastDone). Never throws.
+ * (/api/session/active + message list DONE: parse); v1 rows via the owning
+ * daemon's endpoint (`GET /session/status` + message list DONE: parse);
+ * anything unreachable falls back to the registry heartbeat (status/lastDone
+ * with age). Never throws.
  */
 async function statusRowForRemote(
   entry: RegistryEntry | undefined,
@@ -191,6 +201,24 @@ async function statusRowForRemote(
 ): Promise<string> {
   try {
     if (!entry) return `${id} | unknown | - | not in registry`;
+    if (runtimeOf(entry) === "v1") {
+      // Endpoint-routed live read (short probes; never a full wait). Same-
+      // daemon rows with a live client never reach here (v1Local path above).
+      const url = normalizeV1BaseUrl(entry.endpoint?.url);
+      if (isV1HttpTarget(url)) {
+        try {
+          const map = await v1StatusMap(url, V1_PROBE_TIMEOUT_MS).catch(() => null);
+          if (map !== null) {
+            const status = v1StatusOf(map, id);
+            const text = await v1AssistantText(url, id, 5, 0, V1_PROBE_TIMEOUT_MS).catch(() => "");
+            const done = text !== "" ? (doneLineOf(text) ?? "-") : "-";
+            return `${id} | ${status} | ${done} | ${text !== "" ? oneLineSnippet(text) : "v1-http"}`;
+          }
+        } catch {
+          // fall through to registry fallback
+        }
+      }
+    }
     if (runtimeOf(entry) === "v2") {
       const url =
         (typeof entry.endpoint?.url === "string" && entry.endpoint.url.trim() !== ""
@@ -230,9 +258,13 @@ async function statusRowForRemote(
         }
       }
     }
+    // Registry-heartbeat fallback (honest): the stored heartbeat status is
+    // shown as-is with its age so readers can judge staleness; "unknown" is
+    // reserved for rows that genuinely have no heartbeat status.
     const status = entry.status && entry.status.trim() !== "" ? entry.status : "unknown";
     const done = entry.lastDone && entry.lastDone.trim() !== "" ? entry.lastDone : "-";
-    const where = runtimeOf(entry) === "v2" ? "registry (v2 unreachable)" : "registry";
+    const age = ageTextOf(entry.updatedAt);
+    const where = runtimeOf(entry) === "v2" ? `registry age ${age} (v2 unreachable)` : `registry age ${age}`;
     return `${id} | ${status} | ${done} | ${where}`;
   } catch (err) {
     return `${id} | error | - | ${toReadableError(err)}`;

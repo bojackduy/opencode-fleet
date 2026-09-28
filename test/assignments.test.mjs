@@ -110,10 +110,10 @@ beforeEach(() => {
 });
 
 describe("tool registration", () => {
-  it("keeps the 20 existing tools plus the 5 ownership tools", () => {
+  it("keeps the 20 existing tools plus the 5 ownership tools plus fleet_doctor", () => {
     const names = toolIndex.ALL_TOOL_DEFS.map((d) => d.name);
-    assert.equal(names.length, 27);
-    assert.equal(new Set(names).size, 27);
+    assert.equal(names.length, 28);
+    assert.equal(new Set(names).size, 28);
     for (const n of [
       "fleet_assign",
       "fleet_unassign",
@@ -121,6 +121,7 @@ describe("tool registration", () => {
       "fleet_my_workers",
       "fleet_unassigned",
       "fleet_recover_commander",
+      "fleet_doctor",
       "fleet_exec",
       "fleet_register",
       "fleet_watch",

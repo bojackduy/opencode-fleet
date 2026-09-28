@@ -16,6 +16,7 @@ import type { Runtime } from "../runtime.js";
 import { listRegistry, fleetKeyOf, runtimeOf } from "../registry.js";
 import type { RegistryEntry } from "../registry.js";
 import { scopedRegistryEntries } from "../ownershipControl.js";
+import { liveEntries } from "../liveness.js";
 import { renderTree } from "./fleetRoles.js";
 
 export interface FleetToolDeps {
@@ -50,7 +51,14 @@ export async function fleetListHandler(
     if (scopeAll) {
       entries = await listRegistry({ includeSelf, selfId });
     } else {
-      entries = [...scoped.owned];
+      // Default rows are live-owned workers only (stale/dead rows fail fast
+      // at send time; scope:"all" keeps the explicit global roster/history).
+      const owned = [...scoped.owned];
+      const live = liveEntries(owned);
+      if (live.length === 0 && owned.length > 0) {
+        return `no live workers assigned to you (${owned.length} owned but stale/dead; run fleet_doctor for the next command; scope:"all" shows history)`;
+      }
+      entries = [...live];
       if (includeSelf) {
         const all = await listRegistry({ includeSelf: true, selfId });
         const self = all.find((e) => fleetKeyOf(e) === scoped.callerKey);
@@ -81,7 +89,7 @@ export async function fleetListHandler(
 export const fleetListDef: ToolDef = {
   name: "fleet_list",
   description:
-    "List fleet workers you own (per-commander scoped; entries older than 24h are hidden). Pass scope:\"all\" for an explicit global roster. Excludes self unless includeSelf is true.",
+    "List live fleet workers you own (per-commander scoped, liveness-gated; entries older than 24h are hidden). Pass scope:\"all\" for the explicit global roster/history. Excludes self unless includeSelf is true. Missing workers? Run fleet_doctor first.",
   args: {
     includeSelf: z
       .boolean()

@@ -36,6 +36,7 @@ import {
   fleetUnassignDef,
 } from "./fleetAssign.js";
 import { fleetRecoverCommanderDef } from "./fleetRecover.js";
+import { fleetDoctorDef } from "./fleetDoctor.js";
 
 export const ALL_TOOL_DEFS: readonly ToolDef[] = [
   fleetRegisterDef,
@@ -65,4 +66,5 @@ export const ALL_TOOL_DEFS: readonly ToolDef[] = [
   fleetMyWorkersDef,
   fleetUnassignedDef,
   fleetRecoverCommanderDef,
+  fleetDoctorDef,
 ];

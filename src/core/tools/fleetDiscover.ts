@@ -145,7 +145,7 @@ export async function fleetPsHandler(_args: any, _context: any, _deps?: FleetToo
 export const fleetDiscoverDef: ToolDef = {
   name: "fleet_discover",
   description:
-    "Discover v1 sessions from the shared sqlite DB joined with the fleet registry (read-only, newest first; ownership-annotated).",
+    "Find live sessions to claim (read-only, newest first; ownership-annotated). First-use order: fleet_doctor (if lost) -> fleet_discover/fleet_unassigned -> fleet_assign -> fleet_exec. Control never happens from here.",
   args: {
     limit: z.number().optional().describe("Max sessions to show (default 15)"),
   },

@@ -24,6 +24,7 @@ import { notifyPath } from "../notify.js";
 import { listRegistry, runtimeOf, fleetKeyOf } from "../registry.js";
 import type { RegistryEntry } from "../registry.js";
 import { gateSendToWorker, scopedViewFor, stampEnvelope, validateDelivery } from "../ownershipControl.js";
+import { isLiveEntry, liveEntries, notLiveError } from "../liveness.js";
 import { originFromStamped, recordHandoffOriginStrict } from "../ownershipControl.js";
 
 export interface FleetToolDeps {
@@ -181,10 +182,16 @@ export async function fleetBroadcastHandler(
         : undefined;
 
     if (!only) {
-      const defaults = [...view.ownedKeys]
+      const owned = [...view.ownedKeys]
         .map((k) => byKey.get(k))
         .filter((e): e is RegistryEntry => !!e && e.sessionId !== selfId);
+      // Default fan-out is live-owned workers only: stale/dead rows fail
+      // fast per target instead of burning full timeouts nobody can serve.
+      const defaults = liveEntries(owned);
       if (defaults.length === 0) {
+        if (owned.length > 0) {
+          return `no live workers assigned to you (${owned.length} owned but stale/dead; run fleet_doctor for the next command)`;
+        }
         return `no workers assigned to you (claim workers with fleet_assign first)`;
       }
       return (await Promise.all(defaults.map((e) => sendToOne(e)))).map(
@@ -225,6 +232,11 @@ export async function fleetBroadcastHandler(
           return { sessionId: targetSessionId, ok: false, error: "held for approval, use fleet_allow" };
         }
         return { sessionId: targetSessionId, ok: false, error: gate.error };
+      }
+      // Liveness fail-fast per explicit target (readable "not live" error,
+      // no full-timeout wait on a daemon that is not beating).
+      if (!isLiveEntry(entry)) {
+        return { sessionId: targetSessionId, ok: false, error: notLiveError(targetSessionId, entry) };
       }
       const reqId = `req-${Date.now()}-${randomSuffix()}`;
       const envelope: FleetEnvelope = stampEnvelope(

@@ -541,7 +541,9 @@ export async function server(input: PluginInput) {
   // P4 heartbeat helper: beat() via the v1 API only, then registerSelf
   // with the enriched entry (title/agent/model/status/lastDone). Returns the
   // heartbeat (or null) so event hooks can route scoped ownership events.
-  // Never throws.
+  // The v1 endpoint {kind:'v1-daemon', url:serverUrl} is stamped as routing
+  // metadata only (never ownership) so cross-daemon sends can route direct
+  // HTTP before spool fallback. Never throws.
   const heartbeatAndRegister = async (sessionID: string): Promise<null | {
     sessionId: string;
     daemonId: string;
@@ -552,6 +554,7 @@ export async function server(input: PluginInput) {
   }> => {
     try {
       if (sessionID === "") return null;
+      const endpoint = serverUrlStr !== "" ? { kind: "v1-daemon" as const, url: serverUrlStr } : undefined;
       const hb = await beat({
         client,
         sessionID,
@@ -571,6 +574,7 @@ export async function server(input: PluginInput) {
           role: hb.role,
           runtime: "v1",
           ...(hb.parentID !== "" ? { parentID: hb.parentID } : {}),
+          ...(endpoint ? { endpoint } : {}),
           updatedAt: hb.updatedAt,
         });
         return hb;
@@ -580,6 +584,7 @@ export async function server(input: PluginInput) {
           daemonId,
           directory: String(input.directory ?? ""),
           runtime: "v1",
+          ...(endpoint ? { endpoint } : {}),
         });
         return null;
       }

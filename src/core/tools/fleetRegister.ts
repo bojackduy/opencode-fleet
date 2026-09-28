@@ -57,12 +57,18 @@ export async function fleetRegisterHandler(
     // v1 keeps getDaemonId(serverUrl) (registerSelf adds the `:v1` marker).
     const rt = deps?.rt;
     const runtime: FleetRuntime = rt?.kind === "v2" ? "v2" : "v1";
-    const daemonId = runtime === "v2" && rt ? rt.daemonId : getDaemonId(serverUrlOf(context, deps));
+    const serverUrl = serverUrlOf(context, deps);
+    const daemonId = runtime === "v2" && rt ? rt.daemonId : getDaemonId(serverUrl);
     const ep = runtime === "v2" && rt ? rt.selfEndpoint() : null;
+    // Endpoint is routing metadata only (never ownership): v2 keeps the
+    // service descriptor; v1 stamps {kind:'v1-daemon', url:serverUrl} so
+    // cross-daemon sends can route direct HTTP before spool fallback.
     const endpoint: RegistryEndpoint | undefined =
-      ep === null
-        ? undefined
-        : { kind: ep.kind === "v2-service" ? "v2-service" : "v2-standalone", url: ep.url };
+      ep !== null
+        ? { kind: ep.kind === "v2-service" ? "v2-service" : "v2-standalone", url: ep.url }
+        : serverUrl !== ""
+          ? { kind: "v1-daemon", url: serverUrl }
+          : undefined;
     const directory = String(
       context?.directory ?? context?.worktree ?? ep?.location ?? process.cwd(),
     );
