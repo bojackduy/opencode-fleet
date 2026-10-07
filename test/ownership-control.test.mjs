@@ -30,6 +30,7 @@ const broadcastTools = await import("../dist/core/tools/fleetBroadcast.js");
 const listTools = await import("../dist/core/tools/fleetList.js");
 const statusTools = await import("../dist/core/tools/fleetStatus.js");
 const adminTools = await import("../dist/core/tools/fleetAdmin.js");
+const rolesTools = await import("../dist/core/tools/fleetRoles.js");
 const discoverTools = await import("../dist/core/tools/fleetDiscover.js");
 const handoffTools = await import("../dist/core/tools/fleetHandoff.js");
 const inbox = await import("../dist/core/inbox.js");
@@ -115,6 +116,50 @@ describe("two commanders own disjoint workers; scoped views", () => {
     const view = await scopedViewFor(cA, d.rt);
     assert.ok(view.ok);
     assert.equal(view.ownedKeys.size, 1);
+  });
+
+  it("tree + discover hide foreign workers by default; scope:all is explicit", async () => {
+    await setupTwoOwners();
+    const d = depsV1();
+    const cA = ctxFor("ses_cmd_A");
+
+    const tree = await rolesTools.fleetTreeHandler({}, cA, d);
+    assert.match(tree, /ses_worker_W1/);
+    assert.ok(!tree.includes("ses_worker_W2"), "default tree must not leak foreign worker");
+
+    const treeAll = await rolesTools.fleetTreeHandler({ scope: "all" }, cA, d);
+    assert.match(treeAll, /ses_worker_W1/);
+    assert.match(treeAll, /ses_worker_W2/);
+
+    const ghostTree = await rolesTools.fleetTreeHandler({}, ctxFor("ses_ghost"), d);
+    assert.match(ghostTree, /fleet_tree failed/);
+
+    // Discover falls back to registry rows in isolated XDG (no live sqlite).
+    const disc = await discoverTools.fleetDiscoverHandler({ limit: 15 }, cA, d);
+    if (disc !== "no sessions discovered") {
+      assert.match(disc, /ses_worker_W1/);
+      assert.ok(!disc.includes("ses_worker_W2"), "default discover must not leak foreign worker");
+    }
+
+    const discAll = await discoverTools.fleetDiscoverHandler({ limit: 15, scope: "all" }, cA, d);
+    if (discAll !== "no sessions discovered") {
+      assert.match(discAll, /ses_worker_W1/);
+      assert.match(discAll, /ses_worker_W2/);
+    }
+
+    const ghostDiscAll = await discoverTools.fleetDiscoverHandler(
+      { limit: 15, scope: "all" },
+      ctxFor("ses_ghost"),
+      d,
+    );
+    assert.match(ghostDiscAll, /fleet_discover failed/);
+
+    // Unknown callers keep only unassigned rows, never owned ones.
+    const ghostDisc = await discoverTools.fleetDiscoverHandler({ limit: 15 }, ctxFor("ses_ghost"), d);
+    if (ghostDisc !== "no sessions discovered") {
+      assert.ok(!ghostDisc.includes("ses_worker_W1"), "unknown caller must not see owned rows");
+      assert.ok(!ghostDisc.includes("ses_worker_W2"), "unknown caller must not see owned rows");
+    }
   });
 });
 

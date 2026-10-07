@@ -1,21 +1,27 @@
 /**
  * fleetDiscover.ts — Phase P1 `fleet_discover` + `fleet_ps` tools,
- * Phase B2 ownership-annotated.
+ * Phase B2 default-scoped with an explicit global flag.
  *
- * Read-only discovery over sqlite + registry + ps. These stay OPEN (no
- * commander gate: discovery must work before a worker is claimed), but
- * every registered row carries its ownership annotation (owning commander
- * session, `unassigned` when claimable, `unknown` when assignment state is
- * unreadable, `ambiguous(N)` on bare-id collisions). Claiming is via
- * `fleet_assign`; control never happens from here. Never throws —
+ * Default rows hide workers owned by ANOTHER commander (no accidental
+ * foreign visibility): a resolving commander sees self + own + unassigned;
+ * an unresolvable caller (unknown/peer/fork — e.g. pre-claim onboarding)
+ * sees only unassigned/unknown rows, never another commander's workers.
+ * Pass scope:"all" for the explicit global onboarding roster (requires a
+ * resolvable commander identity, fail-closed otherwise).
+ *
+ * Every registered row carries its ownership annotation (owning commander
+ * composite key, `unassigned` when claimable, `unknown` when assignment
+ * state is unreadable, `ambiguous(N)` on bare-id collisions). Claiming is
+ * via `fleet_assign`; control never happens from here. Never throws —
  * failures render as readable text.
  */
 
 import { depsOf, z } from "../toolDef.js";
 import type { ToolDef } from "../toolDef.js";
+import type { Runtime } from "../runtime.js";
 import { discoverSessionsPreferApi, fleetPs } from "../discover.js";
 import { readAssignments } from "../assignments.js";
-import { shortSessionOf } from "../ownershipControl.js";
+import { resolveCallingCommander, shortSessionOf } from "../ownershipControl.js";
 
 export interface FleetToolDeps {
   // biome-ignore lint/suspicious/noExplicitAny: v1 plugin client is untyped at the boundary.
@@ -88,6 +94,51 @@ function ownerCell(sessionId: string, owners: Map<string, string[]> | null): str
   }
 }
 
+/**
+ * Best-effort caller key for default-scope filtering (never denies: this is
+ * the read-only onboarding path). Empty string when the caller does not
+ * resolve to a commander (unknown/peer/fork). Never throws.
+ */
+async function discoverCallerKey(context: any, rt?: Runtime): Promise<string> {
+  try {
+    const res = await resolveCallingCommander(context as any, rt);
+    return res.ok ? res.callerKey : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Default-scope filter: hide rows owned by another commander. A resolving
+ * commander keeps self + own + unassigned/unknown rows; an unresolvable
+ * caller keeps only unassigned/unknown rows. Corrupt/unreadable assignment
+ * state (owners === null) keeps every row as `unknown` so recovery
+ * discovery stays usable without claiming clean ownership.
+ */
+function rowVisible(
+  sessionId: string,
+  owners: Map<string, string[]> | null,
+  callerKey: string,
+): boolean {
+  try {
+    if (owners === null) return true;
+    const list = owners.get(String(sessionId ?? "")) ?? [];
+    if (list.length === 0) return true; // unassigned: visible for claiming
+    if (callerKey === "") return false; // unknown caller: never show owned rows
+    return list.includes(callerKey);
+  } catch {
+    return false;
+  }
+}
+
+function isScopeAll(args: any): boolean {
+  try {
+    return typeof args?.scope === "string" && args.scope.trim().toLowerCase() === "all";
+  } catch {
+    return false;
+  }
+}
+
 function shortDir(dir: string, max = 48): string {
   try {
     if (dir.length <= max) return dir;
@@ -97,45 +148,65 @@ function shortDir(dir: string, max = 48): string {
   }
 }
 
-export async function fleetDiscoverHandler(args: any, _context: any, _deps?: FleetToolDeps): Promise<string> {
-  void _context;
+export async function fleetDiscoverHandler(args: any, context: any, deps?: FleetToolDeps): Promise<string> {
   try {
     const rawLimit = args?.limit;
     const limit =
       typeof rawLimit === "number" && Number.isFinite(rawLimit)
         ? Math.max(1, Math.min(100, Math.floor(rawLimit)))
         : 15;
+    const rt = (deps as { rt?: Runtime } | undefined)?.rt;
+    if (isScopeAll(args)) {
+      // Explicit global onboarding roster: requires a resolvable commander.
+      const res = await resolveCallingCommander(context as any, rt);
+      if (!res.ok) return `fleet_discover failed: ${res.error}`;
+    }
     // Hot path: heartbeat registry / live API first; sqlite only on a miss.
-    const rows = await discoverSessionsPreferApi(_deps?.client, limit);
+    const rows = await discoverSessionsPreferApi(deps?.client, limit);
     if (rows.length === 0) return "no sessions discovered";
     const now = Date.now();
     const owners = await ownerAnnotations();
+    const callerKey = isScopeAll(args) ? "" : await discoverCallerKey(context, rt);
     const lines = ["sessionId | title | dir | updated | registered | owner"];
-    for (const r of rows.slice(0, limit)) {
+    let shown = 0;
+    for (const r of rows) {
+      if (shown >= limit) break;
+      if (!isScopeAll(args) && !rowVisible(r.id, owners, callerKey)) continue;
       const title = r.title.replace(/\s+/g, " ").trim().slice(0, 60) || "-";
       lines.push(
         `${r.id} | ${title} | ${shortDir(r.directory)} | ${timeAgo(r.timeUpdated, now)} | ${r.registered ? "yes" : "no"} | ${ownerCell(r.id, owners)}`,
       );
+      shown += 1;
     }
+    if (shown === 0) return "no sessions discovered";
     return lines.join("\n");
   } catch (err) {
     return `fleet_discover failed: ${toReadableError(err)}`;
   }
 }
 
-export async function fleetPsHandler(_args: any, _context: any, _deps?: FleetToolDeps): Promise<string> {
-  void _context;
+export async function fleetPsHandler(args: any, context: any, deps?: FleetToolDeps): Promise<string> {
   try {
-    const rows = await fleetPs(50, _deps?.client);
+    const rt = (deps as { rt?: Runtime } | undefined)?.rt;
+    if (isScopeAll(args)) {
+      const res = await resolveCallingCommander(context as any, rt);
+      if (!res.ok) return `fleet_ps failed: ${res.error}`;
+    }
+    const rows = await fleetPs(50, deps?.client);
     if (rows.length === 0) return "no sessions discovered";
     const owners = await ownerAnnotations();
+    const callerKey = isScopeAll(args) ? "" : await discoverCallerKey(context, rt);
     const lines = ["sessionId | title | dir | pid | port | registered | age | owner"];
+    let shown = 0;
     for (const r of rows) {
+      if (!isScopeAll(args) && !rowVisible(r.sessionId, owners, callerKey)) continue;
       const title = r.title.replace(/\s+/g, " ").trim().slice(0, 50) || "-";
       lines.push(
         `${r.sessionId} | ${title} | ${shortDir(r.directory, 40)} | ${r.pidHint || "-"} | ${r.portHint || "-"} | ${r.registered ? "yes" : "no"} | ${r.age} | ${ownerCell(r.sessionId, owners)}`,
       );
+      shown += 1;
     }
+    if (shown === 0) return "no sessions discovered";
     return lines.join("\n");
   } catch (err) {
     return `fleet_ps failed: ${toReadableError(err)}`;
@@ -145,9 +216,13 @@ export async function fleetPsHandler(_args: any, _context: any, _deps?: FleetToo
 export const fleetDiscoverDef: ToolDef = {
   name: "fleet_discover",
   description:
-    "Find live sessions to claim (read-only, newest first; ownership-annotated). First-use order: fleet_doctor (if lost) -> fleet_discover/fleet_unassigned -> fleet_assign -> fleet_exec. Control never happens from here.",
+    "Find live sessions to claim (read-only, newest first; ownership-annotated; default hides workers owned by other commanders). First-use order: fleet_doctor (if lost) -> fleet_discover/fleet_unassigned -> fleet_assign -> fleet_exec. Control never happens from here.",
   args: {
     limit: z.number().optional().describe("Max sessions to show (default 15)"),
+    scope: z
+      .string()
+      .optional()
+      .describe('Row scope: default hides other commanders\' workers; "all" for the explicit global roster (requires commander identity)'),
   },
   run: (args, callCtx, rt) => fleetDiscoverHandler(args, callCtx, depsOf(rt)),
 };
@@ -155,7 +230,12 @@ export const fleetDiscoverDef: ToolDef = {
 export const fleetPsDef: ToolDef = {
   name: "fleet_ps",
   description:
-    "Show fleet processes merged from ps/lsof + sqlite + registry with pid/port hints (read-only, v1 only; ownership-annotated).",
-  args: {},
+    "Show fleet processes merged from ps/lsof + sqlite + registry with pid/port hints (read-only, v1 only; ownership-annotated; default hides workers owned by other commanders).",
+  args: {
+    scope: z
+      .string()
+      .optional()
+      .describe('Row scope: default hides other commanders\' workers; "all" for the explicit global roster (requires commander identity)'),
+  },
   run: (args, callCtx, rt) => fleetPsHandler(args, callCtx, depsOf(rt)),
 };

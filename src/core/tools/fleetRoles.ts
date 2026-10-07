@@ -10,9 +10,11 @@
 
 import { depsOf, z } from "../toolDef.js";
 import type { ToolDef } from "../toolDef.js";
-import { listRegistry, runtimeOf } from "../registry.js";
+import type { Runtime } from "../runtime.js";
+import { listRegistry, fleetKeyOf, runtimeOf } from "../registry.js";
 import type { RegistryEntry } from "../registry.js";
 import { claimCommander, releaseCommander, roleOf } from "../roles.js";
+import { scopedRegistryEntries } from "../ownershipControl.js";
 
 export interface FleetToolDeps {
   // biome-ignore lint/suspicious/noExplicitAny: v1 plugin client is untyped at the boundary.
@@ -174,12 +176,32 @@ export async function fleetTreeHandler(
   context: any,
   deps?: FleetToolDeps,
 ): Promise<string> {
-  void args;
-  void deps;
   try {
+    // Phase B2: per-commander scoped by default (owned workers + self);
+    // scope:"all" is the explicit global hierarchy. Fail-closed on
+    // unknown/non-commander callers and unreadable state. Never throws.
+    const scopeAll =
+      typeof args?.scope === "string" && args.scope.trim().toLowerCase() === "all";
+    const scoped = await scopedRegistryEntries(
+      context as any,
+      (deps as { rt?: Runtime } | undefined)?.rt,
+    );
+    if (!scoped.ok) return `fleet_tree failed: ${scoped.error}`;
     const selfId = selfIdOf(context);
-    const entries = await listRegistry({ includeSelf: true });
-    return renderTree(entries, selfId);
+    if (scopeAll) {
+      const entries = await listRegistry({ includeSelf: true });
+      return renderTree(entries, selfId);
+    }
+    const byKey = new Map(scoped.owned.map((e) => [fleetKeyOf(e), e]));
+    // Always orient on self where the row is still live.
+    try {
+      const all = await listRegistry({ includeSelf: true });
+      const self = all.find((e) => fleetKeyOf(e) === scoped.callerKey);
+      if (self && !byKey.has(scoped.callerKey)) byKey.set(scoped.callerKey, self);
+    } catch {
+      // self-orientation is best-effort; owned rows still render.
+    }
+    return renderTree([...byKey.values()], selfId);
   } catch (err) {
     return `fleet_tree failed: ${toReadableError(err)}`;
   }
@@ -214,7 +236,12 @@ export const fleetReleaseCommanderDef: ToolDef = {
 export const fleetTreeDef: ToolDef = {
   name: "fleet_tree",
   description:
-    "Show the fleet hierarchy grouped by parentID: commanders at top with workers/forks nested, orphans last.",
-  args: {},
+    "Show your fleet hierarchy grouped by parentID (per-commander scoped: owned workers + self; pass scope:\"all\" for the explicit global hierarchy).",
+  args: {
+    scope: z
+      .string()
+      .optional()
+      .describe('Row scope: default is your owned workers + self; "all" for the explicit global hierarchy'),
+  },
   run: (args, callCtx, rt) => fleetTreeHandler(args, callCtx, depsOf(rt)),
 };

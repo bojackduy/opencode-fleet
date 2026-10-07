@@ -7,7 +7,8 @@
   "main": "dist/index.js",
   "exports": {
     ".": "./dist/index.js",
-    "./server": "./dist/index.js"
+    "./server": "./dist/index.js",
+    "./tui": "./dist/tui.js"
   },
   "license": "AGPL-3.0-or-later",
   "private": false,
@@ -45,7 +46,9 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/build-tui.mjs",
+    "build:server": "tsc",
+    "build:tui": "tsc && node scripts/build-tui.mjs",
     "typecheck": "tsc --noEmit",
     "prepack": "npm run typecheck && npm run build",
     "test": "echo \"no tests\" && exit 0",
@@ -56,8 +59,18 @@
   "dependencies": {
     "@opencode-ai/plugin": "1.18.32"
   },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.4.0 <3",
+    "@opentui/core": "*",
+    "@opentui/solid": "*",
+    "solid-js": "*"
+  },
   "devDependencies": {
-    "typescript": "^5.6.3",
-    "@types/node": "^22.7.4"
+    "@opencode/plugin": "^2.0.24",
+    "@opentui/core": "^0.5.14",
+    "@opentui/solid": "^0.5.14",
+    "@types/node": "^22.7.4",
+    "solid-js": "^1.9.16",
+    "typescript": "^5.6.3"
   }
 }
