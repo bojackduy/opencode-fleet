@@ -20,6 +20,7 @@ import { ageTextOf, liveEntries } from "../liveness.js";
 import { isV1HttpTarget, normalizeV1BaseUrl, v1AssistantText, v1StatusMap, v1StatusOf, V1_PROBE_TIMEOUT_MS } from "../v1transport.js";
 import { messageListOf } from "../inbox.js";
 import { passwordForUrl, v2ActiveMap, v2AssistantText } from "../v2transport.js";
+import { loopdSuffix } from "../loopd.js";
 
 export interface FleetToolDeps {
   // biome-ignore lint/suspicious/noExplicitAny: v1 plugin client is untyped at the boundary.
@@ -168,15 +169,15 @@ export async function fleetStatusHandler(
             const res = await client.session.messages({ path: { id }, query: { limit: 5 } });
             messages = messageListOf(res);
           } catch (err) {
-            return `${id} | ${status} | - | messages error: ${toReadableError(err)}`;
+            return `${id} | ${status} | - | messages error: ${toReadableError(err)}${loopdSuffix(byId.get(id)?.directory, id)}`;
           }
             const lastText = lastAssistantText(messages);
             const done = lastText !== "" ? (doneLineOf(lastText) ?? "-") : "-";
-            return `${id} | ${status} | ${done} | ${oneLineSnippet(lastText)}`;
-          } catch (err) {
-            return `${id} | error | - | ${toReadableError(err)}`;
-          }
-        }
+            return `${id} | ${status} | ${done} | ${oneLineSnippet(lastText)}${loopdSuffix(byId.get(id)?.directory, id)}`;
+           } catch (err) {
+             return `${id} | error | - | ${toReadableError(err)}${loopdSuffix(byId.get(id)?.directory, id)}`;
+           }
+         }
         // Part 2: v2 rows (or v1 rows seen from a v2 commander).
         return statusRowForRemote(byId.get(id), id, rt);
       }),
@@ -201,6 +202,7 @@ async function statusRowForRemote(
 ): Promise<string> {
   try {
     if (!entry) return `${id} | unknown | - | not in registry`;
+    const loopd = loopdSuffix(entry.directory, id);
     if (runtimeOf(entry) === "v1") {
       // Endpoint-routed live read (short probes; never a full wait). Same-
       // daemon rows with a live client never reach here (v1Local path above).
@@ -212,7 +214,7 @@ async function statusRowForRemote(
             const status = v1StatusOf(map, id);
             const text = await v1AssistantText(url, id, 5, 0, V1_PROBE_TIMEOUT_MS).catch(() => "");
             const done = text !== "" ? (doneLineOf(text) ?? "-") : "-";
-            return `${id} | ${status} | ${done} | ${text !== "" ? oneLineSnippet(text) : "v1-http"}`;
+            return `${id} | ${status} | ${done} | ${text !== "" ? oneLineSnippet(text) : "v1-http"}${loopd}`;
           }
         } catch {
           // fall through to registry fallback
@@ -237,7 +239,7 @@ async function statusRowForRemote(
             const status = hit !== undefined ? String(hit) : "idle";
             const text = await v2AssistantText(url, pw, id, 5).catch(() => "");
             const done = text !== "" ? (doneLineOf(text) ?? "-") : "-";
-            return `${id} | ${status} | ${done} | ${oneLineSnippet(text)}`;
+            return `${id} | ${status} | ${done} | ${oneLineSnippet(text)}${loopd}`;
           }
         } catch {
           // fall through to in-process/registry
@@ -251,7 +253,7 @@ async function statusRowForRemote(
             const status = info.busy === null ? "unknown" : info.busy ? "busy" : "idle";
             const lastDone = entry.lastDone && entry.lastDone.trim() !== "" ? entry.lastDone : "-";
             const label = `${info.agent !== "" ? info.agent : "?"}/${info.model !== "" ? info.model : "?"}`;
-            return `${id} | ${status} | ${lastDone} | ${label}`;
+            return `${id} | ${status} | ${lastDone} | ${label}${loopd}`;
           }
         } catch {
           // fall through to registry fallback
@@ -265,7 +267,7 @@ async function statusRowForRemote(
     const done = entry.lastDone && entry.lastDone.trim() !== "" ? entry.lastDone : "-";
     const age = ageTextOf(entry.updatedAt);
     const where = runtimeOf(entry) === "v2" ? `registry age ${age} (v2 unreachable)` : `registry age ${age}`;
-    return `${id} | ${status} | ${done} | ${where}`;
+    return `${id} | ${status} | ${done} | ${where}${loopd}`;
   } catch (err) {
     return `${id} | error | - | ${toReadableError(err)}`;
   }

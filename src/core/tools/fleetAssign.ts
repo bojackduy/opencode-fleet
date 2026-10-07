@@ -20,6 +20,7 @@ import { fleetKeyOf, runtimeOf } from "../registry.js";
 import { getDaemonId } from "../inbox.js";
 import { withV1Marker } from "../v1.js";
 import { roleOf } from "../roles.js";
+import { loopdCell } from "../loopd.js";
 import {
   assignWorker,
   listAssignedWorkers,
@@ -261,8 +262,9 @@ export async function fleetMyWorkersHandler(
     }
     const lines = [`workers of ${caller.sessionId} (generation ${r.generation}):`];
     for (const w of r.owned) {
+      const cell = loopdCell(w.entry.directory, w.entry.sessionId);
       lines.push(
-        `${w.entry.sessionId} | ${runtimeOf(w.entry)} | ${w.entry.daemonId} | ${w.entry.directory} | ${labelOf(w.entry)} | gen ${w.assignment.generation}`,
+        `${w.entry.sessionId} | ${runtimeOf(w.entry)} | ${w.entry.daemonId} | ${w.entry.directory} | ${labelOf(w.entry)} | gen ${w.assignment.generation} | ${cell === "-" ? "-" : `loopd:${cell}`}`,
       );
     }
     if (r.stale.length > 0) {

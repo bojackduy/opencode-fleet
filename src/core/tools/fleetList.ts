@@ -18,6 +18,7 @@ import type { RegistryEntry } from "../registry.js";
 import { scopedRegistryEntries } from "../ownershipControl.js";
 import { liveEntries } from "../liveness.js";
 import { renderTree } from "./fleetRoles.js";
+import { loopdCell } from "../loopd.js";
 
 export interface FleetToolDeps {
   // biome-ignore lint/suspicious/noExplicitAny: v1 plugin client is untyped at the boundary.
@@ -73,12 +74,12 @@ export async function fleetListHandler(
     // P5 hierarchy view: group by parentID (commanders top, workers nested).
     if (args?.tree === true) return renderTree(entries, selfId);
     const now = Date.now();
-    const lines = ["sessionId | runtime | daemonId | directory | summary | ageH"];
+    const lines = ["sessionId | runtime | daemonId | directory | summary | ageH | loopd"];
     for (const e of entries) {
       const label = e.summary ?? e.title ?? "";
       const ageH =
         typeof e.updatedAt === "number" ? ((now - e.updatedAt) / 3_600_000).toFixed(1) : "?";
-      lines.push(`${e.sessionId} | ${runtimeOf(e)} | ${e.daemonId} | ${e.directory} | ${label} | ${ageH}`);
+      lines.push(`${e.sessionId} | ${runtimeOf(e)} | ${e.daemonId} | ${e.directory} | ${label} | ${ageH} | ${loopdCell(e.directory, e.sessionId)}`);
     }
     return lines.join("\n");
   } catch (err) {

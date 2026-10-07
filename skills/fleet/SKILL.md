@@ -15,6 +15,7 @@ Opencode-fleet coordinates independent OpenCode sessions. One worker has exactly
 - Registry history is not liveness: a registered row can be stale, dead, closed, or from another daemon.
 - Every delegated task must be self-contained and end with: `DONE:<one-line-result>`.
 - File notifications alone do not wake an idle model; the commander must observe and act.
+- Fleet sees loopd workers' goal name/status/phase via the project-local loopd state (read-only `loopd` column in `fleet_list` / `fleet_my_workers`, `| loopd:…` suffix in `fleet_status`).
 
 ## Commander workflow
 

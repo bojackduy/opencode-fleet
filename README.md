@@ -103,6 +103,20 @@ Reply ending with exactly: DONE:<one-line-result>
 
 Workers reply via `.res.json`; commanders are auto-notified via `.notify.json`.
 
+## loopd goal awareness (read-only)
+
+Fleet rows surface the loopd goal behind a worker when the worker's project
+uses loopd: fleet reads the project-local `<directory>/.opencode/loopd/state.json`
+and joins on the worker (or owner) session ID.
+
+- `fleet_list` / `fleet_my_workers` gain an appended `loopd` column
+  (`<goal-name>:<status>/<phase>`, `-` when none).
+- `fleet_status` rows append `| loopd:<goal-name>:<status>/<phase>` when matched.
+
+Read-only and fail-open: the state file is never written, missing/corrupt/
+oversize state renders as `-` (or no suffix), and existing columns are
+unchanged (append-only).
+
 ## OpenCode v2
 
 The same entry line works in **both** runtimes (minimum v2 `2.0.16`): v2
