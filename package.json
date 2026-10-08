@@ -51,7 +51,7 @@
     "build:tui": "tsc && node scripts/build-tui.mjs",
     "typecheck": "tsc --noEmit",
     "prepack": "npm run typecheck && npm run build",
-    "test": "echo \"no tests\" && exit 0",
+    "test": "node --test test/*.test.mjs",
     "release:patch": "npm run typecheck && npm run build && npm version patch -m \"chore: release %s\" && git push && git push origin $(git describe --tags --abbrev=0)",
     "release:minor": "npm run typecheck && npm run build && npm version minor -m \"chore: release %s\" && git push && git push origin $(git describe --tags --abbrev=0)",
     "release:major": "npm run typecheck && npm run build && npm version major -m \"chore: release %s\" && git push && git push origin $(git describe --tags --abbrev=0)"
