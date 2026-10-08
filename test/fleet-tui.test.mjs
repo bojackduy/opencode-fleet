@@ -54,6 +54,7 @@ describe("fleet dashboard contracts (mirror loopd tabs)", () => {
 
   it("every manual control maps to a registered server tool", () => {
     const names = new Set(toolIndex.ALL_TOOL_DEFS.map((d) => d.name));
+    assert.equal(names.size, 28, "preserve the public tool set");
     for (const [action, tool] of Object.entries(view.FLEET_ACTION_TOOL)) {
       assert.ok(names.has(tool), `${action} -> ${tool} must stay registered`);
     }

@@ -42,11 +42,11 @@ jobs:
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Typecheck & build
+      - name: Typecheck, clean build & test
         run: npm run prepack
 
       - name: Publish to npm
-        run: npm publish --access public
+        run: npm publish --access public --ignore-scripts
 
       - name: Create GitHub release
         if: github.ref_type == 'tag'

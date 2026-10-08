@@ -31,7 +31,8 @@
     "takeover"
   ],
   "files": [
-    "dist",
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
     "index.js",
     "skills",
     "README.md",
@@ -46,15 +47,15 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc && node scripts/build-tui.mjs",
-    "build:server": "tsc",
-    "build:tui": "tsc && node scripts/build-tui.mjs",
+    "build": "node scripts/clean-dist.mjs && tsc && node scripts/build-tui.mjs",
+    "build:server": "npm run build",
+    "build:tui": "npm run build",
     "typecheck": "tsc --noEmit",
-    "prepack": "npm run typecheck && npm run build",
+    "prepack": "npm run typecheck && npm run build && npm test",
     "test": "node --test test/*.test.mjs",
-    "release:patch": "npm run typecheck && npm run build && npm version patch -m \"chore: release %s\" && git push && git push origin $(git describe --tags --abbrev=0)",
-    "release:minor": "npm run typecheck && npm run build && npm version minor -m \"chore: release %s\" && git push && git push origin $(git describe --tags --abbrev=0)",
-    "release:major": "npm run typecheck && npm run build && npm version major -m \"chore: release %s\" && git push && git push origin $(git describe --tags --abbrev=0)"
+    "release:patch": "npm run prepack && npm version patch -m \"chore: release %s\" && git push && git push origin $(git describe --tags --abbrev=0)",
+    "release:minor": "npm run prepack && npm version minor -m \"chore: release %s\" && git push && git push origin $(git describe --tags --abbrev=0)",
+    "release:major": "npm run prepack && npm version major -m \"chore: release %s\" && git push && git push origin $(git describe --tags --abbrev=0)"
   },
   "dependencies": {
     "@opencode-ai/plugin": "1.18.32"

@@ -14,6 +14,7 @@
 
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { startPollLoop } from "./pollLoop.js";
 import { getStableDaemonId } from "./daemonIdentity.js";
 import { INBOX_POLL_MS, hopOf, isHopExceeded, loopGuardText, messagesDir, readReq, writeRes } from "./fileTransport.js";
 import { sameDaemon } from "./v1.js";
@@ -207,14 +208,7 @@ export function startInboxWatcher(opts: StartInboxWatcherOpts): InboxWatcherHand
     }
   };
 
-  const timer: ReturnType<typeof setInterval> = setInterval(() => {
-    if (!running) return;
-    void scan().catch((err: unknown) => log(`fleet inbox scan error: ${toReadableError(err)}`));
-  }, pollMs);
-  // Don't keep the daemon alive just for the watcher.
-  if (typeof (timer as unknown as { unref?: () => void }).unref === "function") {
-    (timer as unknown as { unref: () => void }).unref();
-  }
+  const timer = startPollLoop(scan, pollMs, (err) => log(`fleet inbox scan error: ${toReadableError(err)}`));
 
   async function scan(): Promise<void> {
     await ensureStateMigrated();
@@ -225,6 +219,7 @@ export function startInboxWatcher(opts: StartInboxWatcherOpts): InboxWatcherHand
       return; // No spool dir yet — nothing to do.
     }
     for (const f of files) {
+      if (!running) return;
       if (!f.endsWith(".req.json")) continue;
       const reqId = f.slice(0, -".req.json".length);
       if (claimed.has(reqId) || inFlight.has(reqId)) continue;
@@ -250,6 +245,7 @@ export function startInboxWatcher(opts: StartInboxWatcherOpts): InboxWatcherHand
       ) {
         continue;
       }
+      if (!running) return;
       claimed.add(reqId);
       inFlight.add(reqId);
       void handleOne(reqId, envelope).finally(() => {
@@ -272,6 +268,7 @@ export function startInboxWatcher(opts: StartInboxWatcherOpts): InboxWatcherHand
         return;
       }
       await writeFile(claimedPath(reqId), daemonId, { mode: 0o600 }).catch(() => undefined);
+      if (!running) throw new Error("inbox watcher stopped before delivery");
       const injectText = buildInjectText(envelope);
       const parsedModel = parseFleetModel(envelope.model);
       const body: Record<string, unknown> = {
@@ -348,7 +345,7 @@ export function startInboxWatcher(opts: StartInboxWatcherOpts): InboxWatcherHand
   const handle: InboxWatcherHandle = {
     stop: () => {
       running = false;
-      clearInterval(timer);
+      timer.stop();
     },
     isRunning: () => running,
   };

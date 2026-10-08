@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Clean repository-local `dist` before building and omit maps from npm packages;
+  preserve JS/declarations, dual server/TUI entries, and the fleet skill.
+- Test freshly built code before packing/releasing/publishing; avoid a redundant
+  build in the publish workflow (CI build-before-test fix retained).
+- Serialize inbox scans and periodic rebeats, guard late delivery after cleanup,
+  and make v2 location cleanup idempotent without releasing another reference.
+- Coalesce dashboard refreshes and ignore refresh results after disposal.
+- Add isolated packaging and fake-timer/runtime lifecycle regressions. No claim
+  of benchmarked startup improvement, a measured memory leak, or live TUI rendering.
+
 ## 0.2.4 (2026-09-28) — Direct v1 routing, liveness, doctor, skill
 
 - Stamp v1 daemon endpoint URLs at register/heartbeat (routing metadata only)

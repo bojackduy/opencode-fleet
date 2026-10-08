@@ -158,13 +158,23 @@ export function FleetDashboard(props: Props) {
     }, 10);
   }
 
-  async function refresh(): Promise<void> {
+  let disposed = false;
+  let refreshing: Promise<void> | undefined;
+  function refresh(): Promise<void> {
+    if (disposed) return Promise.resolve();
+    if (refreshing) return refreshing;
+    refreshing = refreshOnce().finally(() => { refreshing = undefined; });
+    return refreshing;
+  }
+  async function refreshOnce(): Promise<void> {
     try {
       const s = await control().refresh();
+      if (disposed) return;
       setSnap(s);
       setSel((prev) => clampFleetSelection(prev, counts()));
       if (s.error) setStatusText(`Error: ${s.error}`);
     } catch (e) {
+      if (disposed) return;
       setStatusText(`Error: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
@@ -540,6 +550,7 @@ export function FleetDashboard(props: Props) {
     setInterval(() => void refresh(), 10000),
   ];
   onCleanup(() => {
+    disposed = true;
     popMode();
     if (focusTimer) clearTimeout(focusTimer);
     for (const u of unsubs) {

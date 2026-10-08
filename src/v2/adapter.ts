@@ -30,6 +30,7 @@
 
 import { appendFile, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { startPollLoop } from "../core/pollLoop.js";
 import { registerSelf, removeSessionScoped, readRegistry, stateDir, ensureStateMigrated } from "../core/registry.js";
 import type { RegistryEndpoint } from "../core/registry.js";
 import { ALL_TOOL_DEFS } from "../core/tools/index.js";
@@ -546,13 +547,7 @@ function startV2SpoolWatcher(log: Runtime["log"]): { stop: () => void } {
   const inFlight = new Set<string>();
   let running = true;
 
-  const timer: ReturnType<typeof setInterval> = setInterval(() => {
-    if (!running) return;
-    void scan().catch((err: unknown) => log("warn", `fleet v2 spool scan error: ${toReadableError(err)}`));
-  }, INBOX_POLL_MS);
-  if (typeof (timer as unknown as { unref?: () => void }).unref === "function") {
-    (timer as unknown as { unref: () => void }).unref();
-  }
+  const timer = startPollLoop(scan, INBOX_POLL_MS, (err) => log("warn", `fleet v2 spool scan error: ${toReadableError(err)}`));
 
   function hostingApis(): Array<{ location: string; api: V2LocationApi }> {
     const s = daemonState();
@@ -587,6 +582,7 @@ function startV2SpoolWatcher(log: Runtime["log"]): { stop: () => void } {
       return; // no spool dir yet
     }
     for (const f of files) {
+      if (!running) return;
       if (!f.endsWith(".req.json")) continue;
       const reqId = f.slice(0, -".req.json".length);
       if (claimed.has(reqId) || inFlight.has(reqId)) continue;
@@ -606,6 +602,7 @@ function startV2SpoolWatcher(log: Runtime["log"]): { stop: () => void } {
       if (targetDaemon !== "" && targetDaemon !== s.daemonId) continue;
       if (!envelope.targetSessionId) continue;
       const host = await findHost(envelope.targetSessionId);
+      if (!running) return;
       if (!host) continue; // not ours — leave for the owning daemon
       claimed.add(reqId);
       inFlight.add(reqId);
@@ -677,6 +674,7 @@ function startV2SpoolWatcher(log: Runtime["log"]): { stop: () => void } {
         }
       }
       await writeFile(claimedPath(reqId), s.daemonId, { mode: 0o600 }).catch(() => undefined);
+      if (!running) throw new Error("spool watcher stopped before delivery");
       const injectText = buildInjectText(envelope);
       // Capture `since` BEFORE injection: the worker's reply is always
       // created after the user bubble lands, so a pre-prompt timestamp can
@@ -740,7 +738,7 @@ function startV2SpoolWatcher(log: Runtime["log"]): { stop: () => void } {
   return {
     stop: () => {
       running = false;
-      clearInterval(timer);
+      timer.stop();
     },
   };
 }
@@ -756,9 +754,7 @@ const V2_REBEAT_MS = 60_000;
  */
 function startV2Rebeat(log: Runtime["log"]): { stop: () => void } {
   let running = true;
-  const timer: ReturnType<typeof setInterval> = setInterval(() => {
-    if (!running) return;
-    void (async () => {
+  const timer = startPollLoop(async () => {
       try {
         const s = daemonState();
         if (s.daemonId === "") return;
@@ -772,6 +768,7 @@ function startV2Rebeat(log: Runtime["log"]): { stop: () => void } {
           }
         });
         for (const row of own) {
+          if (!running) return;
           try {
             // Find the location actually hosting this session.
             let hostLocation = "";
@@ -788,6 +785,7 @@ function startV2Rebeat(log: Runtime["log"]): { stop: () => void } {
                 // try next location
               }
             }
+            if (!running) return;
             if (!hostApi) continue; // not hosted here anymore; leave the row
             const miniRt: Runtime = {
               kind: "v2",
@@ -837,15 +835,11 @@ function startV2Rebeat(log: Runtime["log"]): { stop: () => void } {
       } catch (err) {
         log("warn", `fleet v2 re-beat scan error: ${toReadableError(err)}`);
       }
-    })();
-  }, V2_REBEAT_MS);
-  if (typeof (timer as unknown as { unref?: () => void }).unref === "function") {
-    (timer as unknown as { unref: () => void }).unref();
-  }
+  }, V2_REBEAT_MS, (err) => log("warn", `fleet v2 re-beat scan error: ${toReadableError(err)}`));
   return {
     stop: () => {
       running = false;
-      clearInterval(timer);
+      timer.stop();
     },
   };
 }
@@ -933,7 +927,10 @@ export async function v2Setup(ctx: V2Context): Promise<(() => void) | void> {
 
   // Cleanup on location unload: release this location; stop the watcher when
   // the last location goes away.
+  let disposed = false;
   return () => {
+    if (disposed) return;
+    disposed = true;
     try {
       aborter.abort();
     } catch {

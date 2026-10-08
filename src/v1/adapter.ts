@@ -21,6 +21,7 @@ import { tool } from "@opencode-ai/plugin";
 import type { PluginInput } from "@opencode-ai/plugin";
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { startPollLoop } from "../core/pollLoop.js";
 import {
   buildInjectText,
   claimedPath,
@@ -147,15 +148,7 @@ function startDaemonWatcher(
     }
   };
 
-  const timer: ReturnType<typeof setInterval> = setInterval(() => {
-    if (!running) return;
-    void scan().catch((err: unknown) =>
-      log(`fleet inbox scan error: ${toReadableError(err)}`),
-    );
-  }, pollMs);
-  if (typeof (timer as unknown as { unref?: () => void }).unref === "function") {
-    (timer as unknown as { unref: () => void }).unref();
-  }
+  const timer = startPollLoop(scan, pollMs, (err) => log(`fleet inbox scan error: ${toReadableError(err)}`));
 
   async function scan(): Promise<void> {
     await ensureStateMigrated();
@@ -166,6 +159,7 @@ function startDaemonWatcher(
       return; // no spool dir yet
     }
     for (const f of files) {
+      if (!running) return;
       if (!f.endsWith(".req.json")) continue;
       const reqId = f.slice(0, -".req.json".length);
       if (claimed.has(reqId) || inFlight.has(reqId)) continue;
@@ -184,6 +178,7 @@ function startDaemonWatcher(
       // v2-targeted envelopes (`v2:…`) never match a v1 daemon — routing, not a skip.
       if (targetDaemon !== "" && !sameDaemon(targetDaemon, daemonId)) continue;
       if (!envelope.targetSessionId) continue;
+      if (!running) return;
       claimed.add(reqId);
       inFlight.add(reqId);
       void handleOne(reqId, envelope.targetSessionId, envelope).finally(() => {
@@ -279,6 +274,7 @@ function startDaemonWatcher(
         };
       };
       const beforeTime = Date.now();
+      if (!running) throw new Error("inbox watcher stopped before delivery");
       await c.session.promptAsync({ path: { id: targetSessionId }, body });
       const reply = await pollForReply(c, targetSessionId, beforeTime);
       if (reply === null) {
@@ -359,7 +355,7 @@ function startDaemonWatcher(
   return {
     stop: () => {
       running = false;
-      clearInterval(timer);
+      timer.stop();
     },
     isRunning: () => running,
     daemonId,
@@ -384,9 +380,7 @@ function startPeriodicRebeat(
   log: (m: string) => void,
 ): { stop: () => void } {
   let running = true;
-  const timer: ReturnType<typeof setInterval> = setInterval(() => {
-    if (!running) return;
-    void (async () => {
+  const timer = startPollLoop(async () => {
       try {
         if (!isV1Daemon(serverUrlStr)) return;
         const entries = await readRegistry().catch(() => []);
@@ -399,6 +393,7 @@ function startPeriodicRebeat(
           }
         });
         for (const e of own) {
+          if (!running) return;
           try {
             await beatOne(e.sessionId);
           } catch (err) {
@@ -408,15 +403,11 @@ function startPeriodicRebeat(
       } catch (err) {
         log(`fleet re-beat scan error: ${toReadableError(err)}`);
       }
-    })();
-  }, REBEAT_MS);
-  if (typeof (timer as unknown as { unref?: () => void }).unref === "function") {
-    (timer as unknown as { unref: () => void }).unref();
-  }
+  }, REBEAT_MS, (err) => log(`fleet re-beat scan error: ${toReadableError(err)}`));
   return {
     stop: () => {
       running = false;
-      clearInterval(timer);
+      timer.stop();
     },
   };
 }
@@ -803,4 +794,3 @@ export async function server(input: PluginInput) {
     },
   };
 }
-
