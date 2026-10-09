@@ -650,10 +650,12 @@ export async function server(input: PluginInput) {
           // one bad row must not block the rest
         }
       }
-      if (live.length > 0) await appLog(`fleet startup sweep registered ${live.length} live session(s)`).catch(() => undefined);
+      await appLog(`fleet startup sweep registered ${live.length} live session(s)`).catch(() => undefined);
     } catch {
       // best-effort only
     }
+  } else {
+    await appLog(`fleet startup sweep skipped (v1Ok=false)`).catch(() => undefined);
   }
 
   return {
