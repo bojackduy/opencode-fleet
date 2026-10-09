@@ -13,7 +13,7 @@
 export const V1_BIN = "/opt/homebrew/bin/opencode";
 
 /** Pinned v1 version string. */
-export const V1_VERSION = "1.18.32";
+export const V1_VERSION = "1.18.35";
 
 /** Port used by the v2 `.bun serve --service` daemon — always skipped. */
 export const V2_SERVICE_PORT = "49374";

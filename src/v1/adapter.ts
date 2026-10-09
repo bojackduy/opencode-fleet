@@ -61,6 +61,7 @@ import { ALL_TOOL_DEFS } from "../core/tools/index.js";
 import type { ToolDef } from "../core/toolDef.js";
 import type { CallCtx, LogLevel, Runtime } from "../core/runtime.js";
 import { currentVersion, isV1Daemon, isV1Version, sameDaemon, V1_BIN, V1_VERSION } from "../core/v1.js";
+import { discoverViaClient } from "../core/discover.js";
 
 const RESPONSE_POLL_MS = 500;
 
@@ -633,6 +634,26 @@ export async function server(input: PluginInput) {
     }
   } catch {
     // best-effort only
+  }
+
+  // Startup sweep: sessions created before/at plugin load never emit
+  // session.created to us, and rebeat skips rows stamped by dead daemons —
+  // without this the fleet stays dark after every restart. Same handler as
+  // session.created, run once over this daemon's live sessions. Best-effort.
+  if (v1Ok) {
+    try {
+      const live = await discoverViaClient(client, 200).catch(() => []);
+      for (const s of live) {
+        try {
+          if (typeof s?.id === "string" && s.id !== "") await heartbeatAndRegister(s.id);
+        } catch {
+          // one bad row must not block the rest
+        }
+      }
+      if (live.length > 0) await appLog(`fleet startup sweep registered ${live.length} live session(s)`).catch(() => undefined);
+    } catch {
+      // best-effort only
+    }
   }
 
   return {
